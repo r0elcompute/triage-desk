@@ -29,6 +29,9 @@ from triage_sentinel.data.schemas import (
     EncounterCreate,
     PatientCreate,
 )
+from triage_sentinel.evaluation.schemas import (
+    EvaluateTriageOutput as IittEvaluateTriageOutput,
+)
 from triage_tools_mcp.schemas import (
     AuthenticatedClinician,
     CommitApprovedQueueUpdateInput,
@@ -43,6 +46,7 @@ from triage_tools_mcp.service import (
     APPROVE_PERMISSION,
     COMMIT_PERMISSION,
     ClinicalEvaluator,
+    ClinicalEvaluatorUnavailable,
     TriageToolsService,
 )
 
@@ -216,22 +220,36 @@ def test_validate_vitals_reports_validity_completeness_and_audit(
 
 class FixedEvaluator(ClinicalEvaluator):
     def evaluate(self, data: EvaluateTriageInput) -> EvaluateTriageOutput:
-        return EvaluateTriageOutput(
+        return IittEvaluateTriageOutput(
             status="evaluated",
             assessment_version_id=data.assessment_version_id,
+            protocol_id="SYNTHETIC-PROTOCOL",
             protocol_version="synthetic-protocol-1",
+            assessment_output_version="1.0.0",
             findings=[
                 TriageFinding(
                     code="synthetic.finding",
                     summary="Synthetic finding",
                     severity="info",
                     evidence=["observation:0"],
+                    context_evidence=[],
+                    rule_id="synthetic.finding",
+                    rule_state="met",
+                    source_reference="synthetic test protocol",
                 )
             ],
             supporting_evidence=["observation:0"],
+            missing_information=[],
+            evaluation_uncertainties=[],
+            unsupported_criteria=[],
             evaluated_at=datetime.now(UTC),
             action_id=uuid4(),
         )
+
+
+class UnavailableEvaluator(ClinicalEvaluator):
+    def evaluate(self, data: EvaluateTriageInput) -> EvaluateTriageOutput:
+        raise ClinicalEvaluatorUnavailable("Synthetic evaluator unavailable")
 
 
 def test_evaluate_triage_rules_calls_evaluator_and_structures_errors(
@@ -241,19 +259,27 @@ def test_evaluate_triage_rules_calls_evaluator_and_structures_errors(
     data = EvaluateTriageInput(
         encounter_id=assessment.encounter_id,
         assessment_version_id=assessment.id,
+        age_months=600,
         observations=[],
     )
     result = TriageToolsService(
         session_factory, FixedEvaluator()
     ).evaluate_triage_rules(data)
-    not_configured = TriageToolsService(session_factory).evaluate_triage_rules(data)
+    unavailable = TriageToolsService(
+        session_factory, UnavailableEvaluator()
+    ).evaluate_triage_rules(data)
+    default_evaluator_result = TriageToolsService(
+        session_factory
+    ).evaluate_triage_rules(data)
 
     assert result.status == "evaluated"
     assert result.protocol_version == "synthetic-protocol-1"
     assert result.findings[0].evidence == ["observation:0"]
     assert result.assessment_version_id == assessment.id
     assert result.action_id != uuid4()
-    assert not_configured.code == "EVALUATOR_NOT_CONFIGURED"
+    assert unavailable.code == "EVALUATOR_UNAVAILABLE"
+    assert default_evaluator_result.status == "indeterminate"
+    assert default_evaluator_result.protocol_id == "WHO-IITT-ROUTINE"
     with session_factory() as session:
         rows = session.scalars(
             select(ToolExecution).where(
@@ -265,9 +291,47 @@ def test_evaluate_triage_rules_calls_evaluator_and_structures_errors(
                 AuditLog.entity_type == AuditEntityType.TOOL_EXECUTION.value
             )
         ).all()
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert sum(row.status == "failed" for row in rows) == 1
-    assert len(audit_logs) == 2
+    assert len(audit_logs) == 3
+
+
+def test_configured_iitt_evaluator_returns_versioned_findings_without_queue_write(
+    session_factory: sessionmaker[Session],
+) -> None:
+    assessment = setup_assessment(session_factory)
+    data = EvaluateTriageInput(
+        encounter_id=assessment.encounter_id,
+        assessment_version_id=assessment.id,
+        age_months=600,
+        observations=[
+            {
+                "observation_id": "SYN-OBS-HR-1",
+                "measurement": "heart_rate",
+                "value": "49",
+                "unit": "bpm",
+                "measured_at": "2026-10-14T16:00:00Z",
+                "source": "clinician",
+            },
+        ],
+        presenting_complaints=[
+            {
+                "complaint_id": "SYN-COMPLAINT-1",
+                "concept_code": "SYN-TEST",
+                "summary": "Synthetic complaint",
+            }
+        ],
+    )
+
+    result = TriageToolsService(session_factory).evaluate_triage_rules(data)
+
+    assert result.status == "red_escalation"
+    assert result.protocol_id == "WHO-IITT-ROUTINE"
+    assert result.triage_category == "red"
+    assert result.findings[0].evidence == ["SYN-OBS-HR-1"]
+    assert result.action_id.int != 0
+    with session_factory() as session:
+        assert session.scalars(select(QueueEvent)).all() == []
 
 
 def test_review_request_is_pending_and_does_not_change_queue(

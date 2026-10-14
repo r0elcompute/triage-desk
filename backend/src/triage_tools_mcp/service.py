@@ -31,6 +31,7 @@ from triage_sentinel.data.schemas import (
     QueueEventCreate,
     VitalObservationCreate,
 )
+from triage_sentinel.evaluation.iitt import IittDeterministicEvaluator
 from triage_tools_mcp.schemas import (
     AuthenticatedClinician,
     CommitApprovedQueueUpdateInput,
@@ -79,7 +80,7 @@ class TriageToolsService:
         evaluator: ClinicalEvaluator | None = None,
     ) -> None:
         self._session_factory = session_factory
-        self._evaluator = evaluator
+        self._evaluator = evaluator or IittDeterministicEvaluator()
 
     def validate_vitals(
         self, data: ValidateVitalsInput
@@ -136,11 +137,6 @@ class TriageToolsService:
                 raise ToolFailure(
                     "ASSESSMENT_NOT_FOUND",
                     "Assessment version does not belong to the encounter",
-                )
-            if self._evaluator is None:
-                raise ToolFailure(
-                    "EVALUATOR_NOT_CONFIGURED",
-                    "No deterministic clinical evaluator is configured",
                 )
             try:
                 result = self._evaluator.evaluate(data)
@@ -610,7 +606,11 @@ class TriageToolsService:
     def _validate_observation(
         payload: Mapping[str, object],
     ) -> VitalObservationCreate:
-        return VitalObservationCreate.model_validate(payload)
+        observation_fields = VitalObservationCreate.model_fields
+        normalized_payload = {
+            field: payload[field] for field in observation_fields if field in payload
+        }
+        return VitalObservationCreate.model_validate(normalized_payload)
 
     @staticmethod
     def _require_permission(

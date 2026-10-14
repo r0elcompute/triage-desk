@@ -34,6 +34,34 @@ Configuration examples are in `backend/.env.example` and
 `frontend/.env.example`. Copy them to local environment files as described in
 the root README; local environment files must never be committed.
 
+## Stage 3 deterministic evaluation
+
+The project selects the WHO/ICRC/MSF routine Interagency Integrated Triage
+Tool (IITT) for unscheduled, acutely ill or injured patients in facility-based
+emergency units: the adult poster applies at age 12 and above, and the
+pediatric poster below 12. Mass-casualty triage is excluded. The project does
+not claim Kenyan Ministry of Health approval or universal outpatient/health
+post applicability.
+
+The canonical [protocol record](./clinical-protocols/WHO-IITT.md) documents
+official sources, version metadata, reuse terms, exact implemented criteria,
+and unsupported rules. The evaluator in
+`backend/src/triage_sentinel/evaluation/` validates synthetic typed complaints
+and observations and returns versioned, evidence-linked findings. It
+implements a subset of high-risk vital-sign criteria plus the adult red
+heart-rate and under-2-month pediatric red temperature criteria. Positive
+red findings identify red; high-risk vital signs require clinician review;
+all other cases remain indeterminate because remaining red/yellow criteria
+are not encoded. It never assigns yellow or green and never writes a queue
+event. Source-derived synthetic test expectations and actual results are in
+[EVALS.md](./EVALS.md).
+
+The adult and pediatric poster PDFs do not include a separate reuse notice
+visible in the retrieved documents. The reference card states CC BY-NC-SA
+3.0 IGO; see the protocol record for WHO's general policy and the need to
+confirm rights before commercial use or redistribution. No source PDFs are
+copied into this repository.
+
 ## Stage 4 MCP server
 
 `backend/src/triage_tools_mcp/` contains the `triage-tools-mcp` stdio MCP
@@ -53,10 +81,11 @@ schemas for:
   finite values, timezone-aware measurement times, and the measurements
   explicitly required by the caller.
 - `evaluate_triage_rules`: calls the configured deterministic evaluator and
-  returns its findings, evidence, and protocol version. No clinical evaluator
-  exists in this checkout, so the tool returns
-  `EVALUATOR_NOT_CONFIGURED` until one is provided. Clinical logic belongs in
-  the backend evaluator, not in the MCP tool handlers.
+  returns its findings, evidence, uncertainty, and protocol version. By
+  default the server uses the bundled WHO IITT subset evaluator. An optional
+  `TRIAGE_MCP_CLINICAL_EVALUATOR` can replace it with an object implementing
+  `evaluate(EvaluateTriageInput) -> EvaluateTriageOutput`. Clinical logic
+  belongs in the backend evaluator, not in the MCP transport handlers.
 - `request_clinician_review`: creates an immutable pending request for the
   exact assessment version; it does not write a queue event.
 - `commit_approved_queue_update`: writes a queue-entry event only after the
@@ -76,14 +105,29 @@ default), queue commits fail closed as unauthenticated; do not expose the stdio
 server to untrusted clients or configure a provider that trusts model-supplied
 fields.
 
-The authenticated backend review workflow must call
-`TriageToolsService.approve_review_request` and `revoke_approval` only after
-its own authentication and authorization checks. Those trusted backend
-operations issue and revoke immutable, assessment-bound approvals; neither is
-exposed as an MCP tool.
-
 Tool executions store timestamps, action IDs, error codes, and SHA-256 input
 and output digests rather than raw tool payloads. Successful and failed
 attempts are associated with append-only audit records. Audit records and new
 review/approval/commit tables are added by Alembic revision
 `0002_mcp_review_approvals`.
+
+## Stage 5 LangGraph workflow
+
+The FastAPI backend now exposes a persisted LangGraph workflow that calls the
+four MCP tools over the in-process MCP SDK transport. It validates inputs,
+records deterministic evaluator output and protocol version, validates a
+constrained Ollama model acknowledgement, creates a pending clinician review,
+and stops before any queue change. Queue mutation is only available through
+the MCP commit tool after a clinician resumes the workflow with an exact,
+active approval. See [WORKFLOW.md](./WORKFLOW.md) for the full execution path,
+routes, local model configuration, authentication boundary, hardware check,
+test outcomes, and known limitations.
+
+Install `backend[workflow,mcp]` to enable the optional graph dependency.
+`DATABASE_URL` must be configured to enable workflow routes. The application
+does not bundle authentication middleware: approval requests fail closed
+unless trusted middleware populates `request.state.authenticated_clinician`.
+Do not derive that trusted state from model output or request body fields.
+The separately configured `triage-tools-mcp` stdio service remains available;
+the FastAPI workflow uses the same service methods through the MCP protocol
+in-process.

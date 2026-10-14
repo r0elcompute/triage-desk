@@ -1,10 +1,11 @@
 # Triage Sentinel
 
 Triage Sentinel is the foundation for a healthcare triage MVP. This repository
-contains a Next.js frontend, a FastAPI backend, and the Stage 4
-`triage-tools-mcp` server. The frontend health check remains a connectivity
-check; the repository does not provide medical advice or ship a clinical
-evaluator.
+contains a Next.js frontend, a FastAPI backend, the Stage 4
+`triage-tools-mcp` server, and the Stage 5 LangGraph workflow. It includes a
+limited, deterministic evaluator for
+selected WHO IITT vital-sign criteria; it is not a complete clinical
+evaluator, does not provide medical advice, and is not clinically validated.
 
 ## Prerequisites
 
@@ -14,19 +15,19 @@ evaluator.
 
 PostgreSQL is required for the Stage 2 data layer and repository tests.
 Supabase and orchestration remain optional integrations. See
-[docs/README.md](./docs/README.md) for MCP setup, tool details, and required
-evaluator and identity-provider configuration.
+[docs/README.md](./docs/README.md) for the selected protocol, evaluator
+limitations, MCP setup, tool details, and identity-provider configuration.
 
 ## Setup
 
 From the repository root, create and activate a Python virtual environment and
-install the backend and development dependencies:
+install the backend, development, MCP, and workflow dependencies:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e "backend[dev,database,mcp]"
+python -m pip install -e "backend[dev,database,mcp,workflow]"
 ```
 
 In another terminal, install the frontend dependencies and create its local
@@ -128,13 +129,46 @@ Install only the integrations needed by later stages:
 ```bash
 python -m pip install -e "backend[database]"       # Psycopg PostgreSQL driver
 python -m pip install -e "backend[supabase]"       # Supabase Python client
-python -m pip install -e "backend[orchestration]" # LangGraph
+python -m pip install -e "backend[workflow]"      # LangGraph workflow
 python -m pip install -e "backend[mcp]"           # Python MCP SDK
 ```
 
-The persistence repositories are deliberately not connected to API routes.
-No clinical evaluator or authenticated principal provider is bundled. The MCP
-triage evaluator and consequential queue tool fail closed until configured.
+The workflow API calls typed MCP tools over an in-process MCP SDK transport;
+it does not expose database access to the model. It persists explicit states
+and outcomes, pauses for clinician approval, and uses the protected,
+idempotent MCP queue commit. No authentication middleware is bundled, so the
+approval route fails closed until trusted middleware populates
+`request.state.authenticated_clinician`. See [docs/WORKFLOW.md](./docs/WORKFLOW.md)
+for configuration, execution details, hardware findings, test results, and
+remaining limitations.
+
+## Stage 5 LangGraph workflow
+
+The persisted FastAPI/LangGraph workflow now calls the deterministic evaluator
+and MCP tools, stops with a pending clinician review, and only commits a queue
+update after an authenticated clinician resumes the workflow. It uses a
+locally hosted Ollama model for a schema-validated acknowledgement; tool
+results remain authoritative. See [docs/WORKFLOW.md](./docs/WORKFLOW.md) for
+the actual execution path, configuration, API routes, hardware check,
+test results, and limitations. Ollama was not installed or reachable on the
+checked development machine, so real local-model inference remains
+unverified.
+
+## Clinical protocol and evaluator
+
+The project-selected reference is the WHO/ICRC/MSF routine Interagency
+Integrated Triage Tool (IITT), for facility-based emergency-unit triage:
+adult poster for age 12 and above, pediatric poster for age under 12. The
+implementation covers only a documented subset of high-risk vital-sign
+criteria and two explicit red criteria. It does not infer green from absent
+findings, does not diagnose or prescribe, and never modifies the live queue.
+
+See [docs/clinical-protocols/WHO-IITT.md](./docs/clinical-protocols/WHO-IITT.md)
+for source URLs, version metadata, licensing limitations, exact encoded
+rules, and unsupported criteria. [docs/EVALS.md](./docs/EVALS.md) records
+source-derived synthetic test expectations, actual test results, and
+limitations. This is a competition prototype, not a Kenyan Ministry of
+Health-approved protocol or a clinically validated/approved medical device.
 
 ## Repository layout
 

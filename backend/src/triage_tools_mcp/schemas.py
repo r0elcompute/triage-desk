@@ -13,6 +13,15 @@ from pydantic import (
 )
 
 from triage_sentinel.data.enums import Measurement
+from triage_sentinel.evaluation.schemas import (
+    EvaluateTriageInput as EvaluateTriageInput,
+)
+from triage_sentinel.evaluation.schemas import (
+    EvaluateTriageOutput as EvaluateTriageOutput,
+)
+from triage_sentinel.evaluation.schemas import (
+    TriageFinding as TriageFinding,
+)
 
 IdempotencyKey = Annotated[
     str,
@@ -59,30 +68,6 @@ class ValidateVitalsOutput(ToolSchema):
     missing_measurements: list[Measurement]
     issues: list[ValidationIssue]
     validated_at: AwareDatetime
-    action_id: UUID
-
-
-class EvaluateTriageInput(ToolSchema):
-    encounter_id: UUID
-    assessment_version_id: UUID
-    observations: list[ObservationPayload]
-    evaluated_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class TriageFinding(ToolSchema):
-    code: str
-    summary: str
-    severity: Literal["info", "warning", "urgent"]
-    evidence: list[str]
-
-
-class EvaluateTriageOutput(ToolSchema):
-    status: Literal["evaluated"]
-    assessment_version_id: UUID
-    protocol_version: str
-    findings: list[TriageFinding]
-    supporting_evidence: list[str]
-    evaluated_at: AwareDatetime
     action_id: UUID
 
 
