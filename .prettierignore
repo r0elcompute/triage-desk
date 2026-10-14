@@ -1,0 +1,9 @@
+.git
+**/.next/**
+**/node_modules/**
+**/.pytest_cache/**
+**/__pycache__/**
+backend/.venv
+backend/dist
+frontend/package-lock.json
+frontend/next-env.d.ts

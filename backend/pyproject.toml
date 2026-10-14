@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triage-sentinel-backend"
+version = "0.1.0"
+description = "FastAPI foundation for Triage Sentinel"
+requires-python = ">=3.11"
+dependencies = [
+    "alembic>=1.15,<2.0",
+    "fastapi>=0.115,<1.0",
+    "pydantic-settings>=2.8,<3.0",
+    "sqlalchemy>=2.0,<3.0",
+    "uvicorn[standard]>=0.34,<1.0",
+]
+
+[project.scripts]
+triage-tools-mcp = "triage_tools_mcp.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1.0",
+    "pytest>=8.3,<9.0",
+    "ruff>=0.11,<1.0",
+]
+database = ["psycopg[binary]>=3.2,<4.0"]
+supabase = [
+    "supabase>=2.15,<3.0",
+]
+orchestration = [
+    "langgraph>=1.0,<2.0",
+    "mcp>=1.6,<2.0",
+]
+mcp = ["mcp>=1.6,<2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["../tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
