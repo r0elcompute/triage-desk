@@ -1,11 +1,10 @@
 # Triage Sentinel
 
 Triage Sentinel is the foundation for a healthcare triage MVP. This repository
-contains a Next.js frontend, a FastAPI backend, the Stage 4
-`triage-tools-mcp` server, and the Stage 5 LangGraph workflow. It includes a
-limited, deterministic evaluator for
-selected WHO IITT vital-sign criteria; it is not a complete clinical
-evaluator, does not provide medical advice, and is not clinically validated.
+contains a Next.js frontend, a FastAPI backend, and the Stage 4
+`triage-tools-mcp` server. The frontend health check remains a connectivity
+check; the repository does not provide medical advice or ship a clinical
+evaluator.
 
 ## Prerequisites
 
@@ -27,7 +26,7 @@ install the backend, development, MCP, and workflow dependencies:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e "backend[dev,database,mcp,workflow]"
+python -m pip install -e "backend[dev,database,mcp]"
 ```
 
 In another terminal, install the frontend dependencies and create its local
@@ -45,6 +44,23 @@ Copy its example if you want to customize the defaults:
 ```bash
 cp backend/.env.example backend/.env
 ```
+
+Stage 5 uses a local Ollama-compatible server. Install Ollama separately, then
+pull the default small model and start its server:
+
+```bash
+ollama pull qwen3:1.7b
+ollama serve
+```
+
+The default model is listed by Ollama at about 1.4 GB; actual CPU inference
+speed depends on the host. Configure `TRIAGE_OLLAMA_MODEL` and
+`TRIAGE_OLLAMA_URL` in `backend/.env` as needed. Configure
+`TRIAGE_WORKFLOW_PRINCIPAL_PROVIDER` to a trusted backend callable that derives
+an `AuthenticatedClinician` from the authenticated FastAPI request; never trust
+identity or permissions supplied in workflow JSON. The clinician principal
+provider and evaluator are not bundled, so workflow start and queue commits
+remain disabled until trusted integrations are configured.
 
 Environment files are ignored by Git. Do not put secrets in tracked files.
 Set `DATABASE_URL` in `backend/.env` to a PostgreSQL connection string.
@@ -99,6 +115,55 @@ Set `TRIAGE_API_URL` in `frontend/.env.local` to change the backend URL. Set
 `CORS_ORIGINS` in `backend/.env` to a comma-separated list of allowed browser
 origins for direct API access.
 
+The Stage 5 endpoints are `POST /workflows/triage` to start an evaluation and
+create a pending review, and `POST /workflows/{workflow_id}/approve` to resume
+after independent clinician authentication and authorization. A workflow
+cannot commit when input validation, deterministic evaluation, or structured
+model-output validation fails. The model only formats values returned by MCP;
+it cannot set clinical findings or approve an action. The implementation is a
+competition prototype, not a clinically validated or approved medical device.
+The selected clinical setting and protocol limitations are documented in
+[docs/README.md](./docs/README.md).
+
+## Stage 6 Filesystem MCP
+
+Stage 6 uses the official `@modelcontextprotocol/server-filesystem` npm package
+at exact version `1.0.0`, with a committed npm lockfile and immutable Node base
+image. Build its isolated runtime image from the repository root:
+
+```bash
+docker build -t triage-filesystem-mcp:1.0.0 backend/filesystem-mcp
+```
+
+Set `TRIAGE_PROTOCOL_REFERENCE_DIRECTORY` to the dedicated
+`docs/clinical-protocols/approved` directory; its example value assumes the
+backend is started from `backend/`. The Docker child has no network, a read-only
+root filesystem, dropped capabilities, and a read-only bind mount of that
+directory at `/protocols`. Although the official server exposes write-capable
+tools, the workflow invokes only `read_text_file` and verifies that the server
+allows only `/protocols`. Running it requires Docker daemon access, which is
+privileged and must be restricted to the trusted backend runtime.
+
+Each workflow request supplies a `protocol_id`. The server reads the registry
+and selected UTF-8 document through MCP, checks approval status, version, safe
+relative path, and SHA-256, then passes the verified text only to the
+deterministic evaluator. Document contents are not sent to the language model.
+The approved registry is intentionally empty because this checkout has no
+verified/authorized clinical protocol; such requests fail closed to clinician
+review. The successful sample is a non-clinical test fixture only.
+
+Build the image, then run actual external-server security and retrieval tests:
+
+```bash
+docker build -t triage-filesystem-mcp:1.0.0 backend/filesystem-mcp
+TRIAGE_RUN_FILESYSTEM_MCP_INTEGRATION=1 python -m pytest -q tests/test_reference_mcp.py
+```
+
+The complete workflow test additionally requires PostgreSQL, Ollama, and the
+test-only synthetic evaluator/principal. See [EVALS.md](./EVALS.md) for the
+exact command and observed results, and [ARCHITECTURE.md](./ARCHITECTURE.md) for
+the execution and security boundaries.
+
 ## Tests and quality checks
 
 Run backend tests from the repository root:
@@ -129,46 +194,13 @@ Install only the integrations needed by later stages:
 ```bash
 python -m pip install -e "backend[database]"       # Psycopg PostgreSQL driver
 python -m pip install -e "backend[supabase]"       # Supabase Python client
-python -m pip install -e "backend[workflow]"      # LangGraph workflow
+python -m pip install -e "backend[orchestration]" # LangGraph
 python -m pip install -e "backend[mcp]"           # Python MCP SDK
 ```
 
-The workflow API calls typed MCP tools over an in-process MCP SDK transport;
-it does not expose database access to the model. It persists explicit states
-and outcomes, pauses for clinician approval, and uses the protected,
-idempotent MCP queue commit. No authentication middleware is bundled, so the
-approval route fails closed until trusted middleware populates
-`request.state.authenticated_clinician`. See [docs/WORKFLOW.md](./docs/WORKFLOW.md)
-for configuration, execution details, hardware findings, test results, and
-remaining limitations.
-
-## Stage 5 LangGraph workflow
-
-The persisted FastAPI/LangGraph workflow now calls the deterministic evaluator
-and MCP tools, stops with a pending clinician review, and only commits a queue
-update after an authenticated clinician resumes the workflow. It uses a
-locally hosted Ollama model for a schema-validated acknowledgement; tool
-results remain authoritative. See [docs/WORKFLOW.md](./docs/WORKFLOW.md) for
-the actual execution path, configuration, API routes, hardware check,
-test results, and limitations. Ollama was not installed or reachable on the
-checked development machine, so real local-model inference remains
-unverified.
-
-## Clinical protocol and evaluator
-
-The project-selected reference is the WHO/ICRC/MSF routine Interagency
-Integrated Triage Tool (IITT), for facility-based emergency-unit triage:
-adult poster for age 12 and above, pediatric poster for age under 12. The
-implementation covers only a documented subset of high-risk vital-sign
-criteria and two explicit red criteria. It does not infer green from absent
-findings, does not diagnose or prescribe, and never modifies the live queue.
-
-See [docs/clinical-protocols/WHO-IITT.md](./docs/clinical-protocols/WHO-IITT.md)
-for source URLs, version metadata, licensing limitations, exact encoded
-rules, and unsupported criteria. [docs/EVALS.md](./docs/EVALS.md) records
-source-derived synthetic test expectations, actual test results, and
-limitations. This is a competition prototype, not a Kenyan Ministry of
-Health-approved protocol or a clinically validated/approved medical device.
+The persistence repositories are deliberately not connected to API routes.
+No clinical evaluator or authenticated principal provider is bundled. The MCP
+triage evaluator and consequential queue tool fail closed until configured.
 
 ## Repository layout
 

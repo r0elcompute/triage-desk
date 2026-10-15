@@ -2,12 +2,13 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
-from typing import Protocol, TypeVar
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Literal, Protocol, TypeVar
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import Connection, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -24,6 +25,7 @@ from triage_sentinel.data.models import (
     QueueCommit,
     ToolExecution,
     TriageEncounter,
+    VitalObservation,
 )
 from triage_sentinel.data.repositories import EventRepository
 from triage_sentinel.data.schemas import (
@@ -72,6 +74,20 @@ class ToolFailure(Exception):
         self.code = code
         self.retryable = retryable
 
+    def __str__(self) -> str:
+        return f"{self.code}: {super().__str__()}"
+
+
+@dataclass(slots=True)
+class ReassessmentReviewResult:
+    status: Literal["pending", "not_triggered"]
+    request_id: UUID | None
+    encounter_id: UUID
+    assessment_version_id: UUID
+    rule_reference: str | None
+    reason: str | None = None
+    created_at: datetime | None = None
+
 
 class TriageToolsService:
     def __init__(
@@ -81,6 +97,202 @@ class TriageToolsService:
     ) -> None:
         self._session_factory = session_factory
         self._evaluator = evaluator or IittDeterministicEvaluator()
+
+    def request_reassessment_review(
+        self,
+        encounter_id: UUID,
+        observation: VitalObservationCreate,
+        *,
+        rule_reference: str | None = None,
+    ) -> ReassessmentReviewResult:
+        try:
+            if not isinstance(observation, VitalObservationCreate):
+                observation = VitalObservationCreate.model_validate(observation)
+        except ValidationError as error:
+            raise ToolFailure(
+                "INVALID_OBSERVATION",
+                "Observation payload is invalid and cannot be evaluated",
+            ) from error
+
+        if observation.source_reference is None or not observation.source_reference.startswith(
+            "SYN-"
+        ):
+            raise ToolFailure(
+                "INVALID_OBSERVATION",
+                "Observation source_reference must use a synthetic identity",
+            )
+
+        if rule_reference is None or not rule_reference.strip():
+            raise ToolFailure(
+                "INVALID_RULE_REFERENCE",
+                "A protocol rule_reference is required to assess reassessment triggers",
+            )
+
+        sanitized_rule = rule_reference.strip()
+
+        if isinstance(self._session_factory, Connection):
+            session = Session(bind=self._session_factory, expire_on_commit=False)
+            with session.begin_nested():
+                return self._request_reassessment_review_session(
+                    session, encounter_id, observation, sanitized_rule
+                )
+
+        with self._session_factory.begin() as session:
+            return self._request_reassessment_review_session(
+                session, encounter_id, observation, sanitized_rule
+            )
+
+    def _request_reassessment_review_session(
+        self,
+        session: Session,
+        encounter_id: UUID,
+        observation: VitalObservationCreate,
+        rule_reference: str,
+    ) -> ReassessmentReviewResult:
+        if observation.source_reference is None or not observation.source_reference.startswith(
+            "SYN-"
+        ):
+            raise ToolFailure(
+                "INVALID_OBSERVATION",
+                "Observation source_reference must use a synthetic identity",
+            )
+
+        encounter = session.get(TriageEncounter, encounter_id)
+        if encounter is None:
+            raise ToolFailure("ENCOUNTER_NOT_FOUND", "Encounter was not found")
+
+        assessment = session.scalar(
+            select(AssessmentVersion)
+            .where(AssessmentVersion.encounter_id == encounter_id)
+            .order_by(AssessmentVersion.version.desc())
+            .limit(1)
+        )
+        if assessment is None:
+            raise ToolFailure(
+                "ASSESSMENT_NOT_FOUND",
+                "Encounter does not have an assessment version to reassess",
+            )
+
+        history = session.scalars(
+            select(VitalObservation)
+            .where(VitalObservation.encounter_id == encounter_id)
+            .order_by(
+                VitalObservation.measured_at.desc(),
+                VitalObservation.created_at.desc(),
+            )
+        ).all()
+
+        for existing in history:
+            if (
+                existing.measurement == observation.measurement.value
+                and existing.value == observation.value
+                and existing.unit == observation.unit.value
+                and existing.measured_at == observation.measured_at
+            ):
+                reason = (
+                    f"Protocol trigger {rule_reference}: duplicate observation "
+                    f"for {observation.measurement.value} at "
+                    f"{observation.measured_at.isoformat()}"
+                )
+                existing_request = session.scalar(
+                    select(ClinicianReviewRequest)
+                    .where(
+                        ClinicianReviewRequest.encounter_id == encounter_id,
+                        ClinicianReviewRequest.assessment_version_id == assessment.id,
+                        ClinicianReviewRequest.reason.like(f"%{rule_reference}%"),
+                        ClinicianReviewRequest.created_at
+                        >= datetime.now(UTC) - timedelta(days=7),
+                    )
+                    .order_by(ClinicianReviewRequest.created_at.desc())
+                )
+                if existing_request is not None:
+                    return ReassessmentReviewResult(
+                        status="pending",
+                        request_id=existing_request.id,
+                        encounter_id=encounter_id,
+                        assessment_version_id=assessment.id,
+                        rule_reference=rule_reference,
+                        reason=existing_request.reason,
+                        created_at=existing_request.created_at,
+                    )
+
+                request = ClinicianReviewRequest(
+                    assessment_version_id=assessment.id,
+                    encounter_id=encounter_id,
+                    requested_by_reference=SERVICE_ACTOR,
+                    reason=reason,
+                    created_at=datetime.now(UTC),
+                )
+                session.add(request)
+                session.flush()
+                return ReassessmentReviewResult(
+                    status="pending",
+                    request_id=request.id,
+                    encounter_id=encounter_id,
+                    assessment_version_id=assessment.id,
+                    rule_reference=rule_reference,
+                    reason=request.reason,
+                    created_at=request.created_at,
+                )
+
+        for existing in history:
+            if (
+                existing.measurement == observation.measurement.value
+                and observation.measured_at < existing.measured_at
+            ):
+                reason = (
+                    f"Protocol trigger {rule_reference}: stale observation "
+                    f"for {observation.measurement.value} at "
+                    f"{observation.measured_at.isoformat()}"
+                )
+                existing_request = session.scalar(
+                    select(ClinicianReviewRequest)
+                    .where(
+                        ClinicianReviewRequest.encounter_id == encounter_id,
+                        ClinicianReviewRequest.assessment_version_id == assessment.id,
+                        ClinicianReviewRequest.reason.like(f"%{rule_reference}%"),
+                        ClinicianReviewRequest.created_at
+                        >= datetime.now(UTC) - timedelta(days=7),
+                    )
+                    .order_by(ClinicianReviewRequest.created_at.desc())
+                )
+                if existing_request is not None:
+                    return ReassessmentReviewResult(
+                        status="pending",
+                        request_id=existing_request.id,
+                        encounter_id=encounter_id,
+                        assessment_version_id=assessment.id,
+                        rule_reference=rule_reference,
+                        reason=existing_request.reason,
+                        created_at=existing_request.created_at,
+                    )
+
+                request = ClinicianReviewRequest(
+                    assessment_version_id=assessment.id,
+                    encounter_id=encounter_id,
+                    requested_by_reference=SERVICE_ACTOR,
+                    reason=reason,
+                    created_at=datetime.now(UTC),
+                )
+                session.add(request)
+                session.flush()
+                return ReassessmentReviewResult(
+                    status="pending",
+                    request_id=request.id,
+                    encounter_id=encounter_id,
+                    assessment_version_id=assessment.id,
+                    rule_reference=rule_reference,
+                    reason=request.reason,
+                    created_at=request.created_at,
+                )
+
+        return ReassessmentReviewResult(
+            status="not_triggered",
+            request_id=None,
+            encounter_id=encounter_id,
+            assessment_version_id=assessment.id,
+            rule_reference=None,
+        )
 
     def validate_vitals(
         self, data: ValidateVitalsInput
@@ -382,14 +594,30 @@ class TriageToolsService:
                     "STALE_ASSESSMENT",
                     "Cannot approve a superseded assessment version",
                 )
-            if session.scalar(
-                select(ClinicianApproval.id).where(
-                    ClinicianApproval.request_id == request.id
-                )
-            ):
-                raise ToolFailure(
-                    "ALREADY_APPROVED", "Review request is already approved"
-                )
+            existing_approval = session.scalar(
+                select(ClinicianApproval)
+                .where(ClinicianApproval.request_id == request.id)
+                .with_for_update()
+            )
+            if existing_approval is not None:
+                if (
+                    existing_approval.clinician_subject != clinician.subject
+                    or existing_approval.clinician_reference != clinician.reference
+                ):
+                    raise ToolFailure(
+                        "ALREADY_APPROVED",
+                        "Review request was approved by a different clinician",
+                    )
+                if session.scalar(
+                    select(ClinicianApprovalRevocation.id).where(
+                        ClinicianApprovalRevocation.approval_id
+                        == existing_approval.id
+                    )
+                ):
+                    raise ToolFailure(
+                        "APPROVAL_REVOKED", "Approval has been revoked"
+                    )
+                return existing_approval.id
             approval = ClinicianApproval(
                 request_id=request.id,
                 assessment_version_id=assessment.id,

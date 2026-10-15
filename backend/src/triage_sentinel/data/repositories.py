@@ -16,6 +16,7 @@ from triage_sentinel.data.models import (
     ToolExecution,
     TriageEncounter,
     VitalObservation,
+    WorkflowExecution,
 )
 from triage_sentinel.data.schemas import (
     AssessmentEvidenceCreate,
@@ -301,3 +302,17 @@ class EventRepository:
             .order_by(AuditLog.occurred_at, AuditLog.id)
         )
         return self.session.scalars(statement).all()
+
+
+class WorkflowExecutionRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(self, **values: object) -> WorkflowExecution:
+        execution = WorkflowExecution(**values)
+        self.session.add(execution)
+        self.session.flush()
+        return execution
+
+    def get(self, execution_id: UUID) -> WorkflowExecution | None:
+        return self.session.get(WorkflowExecution, execution_id)

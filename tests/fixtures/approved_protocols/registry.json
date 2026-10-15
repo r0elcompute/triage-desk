@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "documents": [
+    {
+      "document_id": "TEST-SYNTHETIC-PROTOCOL",
+      "version": "test-v1",
+      "approval_status": "approved",
+      "document_class": "synthetic-test",
+      "file": "synthetic-protocol.md",
+      "sha256": "3f28ed8b465c9605f37b1f6fc856f161ae30d7f36a3129823612367d59cc0a6a",
+      "source_url": "test-fixture://synthetic-protocol",
+      "license": "Synthetic test fixture; no third-party clinical content"
+    }
+  ]
+}

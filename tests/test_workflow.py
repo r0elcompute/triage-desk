@@ -1,26 +1,23 @@
-import asyncio
-import json
-from collections.abc import Iterator
+import hashlib
+import os
 from datetime import UTC, datetime
-from decimal import Decimal
-from uuid import uuid4
+from pathlib import Path
+from uuid import UUID, uuid4
 
-import httpx
 import pytest
-from fastapi import HTTPException, Request
-from sqlalchemy import CheckConstraint, create_engine, event, select
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
-from triage_sentinel.data.enums import (
-    AuditEntityType,
-)
+from triage_sentinel.data.database import create_session_factory
+from triage_sentinel.data.enums import Measurement
 from triage_sentinel.data.models import (
-    AssessmentVersion,
     AuditLog,
-    Base,
+    ClinicianApproval,
+    ClinicianReviewRequest,
     QueueCommit,
     QueueEvent,
-    ToolExecution,
     WorkflowExecution,
 )
 from triage_sentinel.data.repositories import (
@@ -33,469 +30,476 @@ from triage_sentinel.data.schemas import (
     EncounterCreate,
     PatientCreate,
 )
-from triage_sentinel.evaluation.schemas import (
-    ClinicalObservation,
-    EvaluateTriageInput,
-    EvaluateTriageOutput,
+from triage_sentinel.main import app
+from triage_sentinel.reference_mcp import (
+    FILESYSTEM_SERVER_ID,
+    ReferenceRetrievalAudit,
+    ReferenceRetrievalResult,
 )
-from triage_sentinel.workflow.engine import (
-    OllamaChatModel,
+from triage_sentinel.workflow import (
+    OllamaStructuredModel,
+    RecommendationDraft,
     TriageWorkflow,
-    WorkflowFailure,
+    WorkflowRequest,
+    _expected_draft,
 )
-from triage_sentinel.workflow.schemas import (
-    ModelAcknowledgement,
-    WorkflowStartInput,
-)
-from triage_tools_mcp.schemas import AuthenticatedClinician
-from triage_tools_mcp.service import (
-    APPROVE_PERMISSION,
-    COMMIT_PERMISSION,
-    ClinicalEvaluator,
-    ClinicalEvaluatorUnavailable,
-    TriageToolsService,
+from triage_tools_mcp.schemas import (
+    AuthenticatedClinician,
+    CommitApprovedQueueUpdateOutput,
+    EvaluateTriageOutput,
+    ProtocolReferenceInput,
+    RequestClinicianReviewOutput,
+    ValidateVitalsOutput,
 )
 
-SYNTHETIC_EXPECTED_PENDING = {
-    "status": "awaiting_clinician_approval",
-    "queue_event_count": 0,
-    "validation_complete": True,
-    "evaluator_status": "indeterminate",
-}
-SYNTHETIC_EXPECTED_COMMIT = {
-    "status": "completed",
-    "queue_event_count": 1,
-    "commit_status": "committed",
-}
+
+class FakeTools:
+    def __init__(self, *, complete: bool = True, timeout_validation: bool = False):
+        self.complete = complete
+        self.timeout_validation = timeout_validation
+        self.calls: list[tuple[str, dict]] = []
+        self.assessment_id = uuid4()
+        self.encounter_id = uuid4()
+
+    async def call_tool(self, name: str, arguments: dict):
+        self.calls.append((name, arguments))
+        if name == "validate_vitals":
+            if self.timeout_validation:
+                raise TimeoutError
+            return ValidateVitalsOutput(
+                valid=True,
+                complete=self.complete,
+                missing_measurements=([] if self.complete else [Measurement.HEART_RATE]),
+                issues=[],
+                validated_at=datetime.now(UTC),
+                action_id=uuid4(),
+            )
+        if name == "evaluate_triage_rules":
+            return EvaluateTriageOutput(
+                status="evaluated",
+                assessment_version_id=self.assessment_id,
+                protocol_version="synthetic-test-protocol",
+                findings=[],
+                supporting_evidence=[],
+                evaluated_at=datetime.now(UTC),
+                action_id=uuid4(),
+            )
+        if name == "request_clinician_review":
+            return RequestClinicianReviewOutput(
+                status="pending",
+                request_id=uuid4(),
+                assessment_version_id=self.assessment_id,
+                created_at=datetime.now(UTC),
+                action_id=uuid4(),
+            )
+        if name == "commit_approved_queue_update":
+            return CommitApprovedQueueUpdateOutput(
+                status="committed",
+                queue_event_id=uuid4(),
+                commit_id=uuid4(),
+                assessment_version_id=UUID(arguments["assessment_version_id"]),
+                approval_id=UUID(arguments["approval_id"]),
+                action_id=uuid4(),
+            )
+        raise AssertionError(f"Unexpected MCP tool call: {name}")
 
 
-@pytest.fixture
-def session_factory() -> Iterator[sessionmaker[Session]]:
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+class ExactModel:
+    model_id = "test-open-weight-model"
+
+    async def generate(self, evaluation: EvaluateTriageOutput) -> RecommendationDraft:
+        return _expected_draft(evaluation)
+
+
+class FakeReferenceClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def retrieve(self, document_id: str) -> ReferenceRetrievalResult:
+        self.calls.append(document_id)
+        content = "Synthetic non-clinical protocol fixture."
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return ReferenceRetrievalResult(
+            document=ProtocolReferenceInput(
+                protocol_id=document_id,
+                version="synthetic-test-protocol",
+                approval_status="approved",
+                document_class="synthetic-test",
+                source_url="test-fixture://synthetic-protocol",
+                license="Synthetic test fixture",
+                content_sha256=digest,
+                content=content,
+            ),
+            audit=ReferenceRetrievalAudit(
+                server_identity=FILESYSTEM_SERVER_ID,
+                requested_document_id=document_id,
+                returned_version="synthetic-test-protocol",
+                content_sha256=digest,
+                status="succeeded",
+            ),
+        )
+
+
+class MissingReferenceClient:
+    async def retrieve(self, document_id: str) -> ReferenceRetrievalResult:
+        return ReferenceRetrievalResult(
+            document=None,
+            audit=ReferenceRetrievalAudit(
+                requested_document_id=document_id,
+                status="failed",
+                error_code="PROTOCOL_DOCUMENT_NOT_FOUND",
+            ),
+        )
+
+
+class InventingModel(ExactModel):
+    async def generate(self, evaluation: EvaluateTriageOutput) -> RecommendationDraft:
+        expected = _expected_draft(evaluation)
+        return expected.model_copy(update={"finding_codes": ["model.invented"]})
+
+
+def workflow_request(tools: FakeTools) -> WorkflowRequest:
+    return WorkflowRequest(
+        encounter_id=tools.encounter_id,
+        assessment_version_id=tools.assessment_id,
+        protocol_id="TEST-SYNTHETIC-PROTOCOL",
+        observations=[
+            {
+                "measurement": "heart_rate",
+                "value": 72,
+                "unit": "bpm",
+                "measured_at": "2026-10-14T12:00:00Z",
+                "source": "device",
+                "source_reference": "SYN-DEVICE-01",
+            }
+        ],
+        required_measurements=[Measurement.HEART_RATE],
     )
 
-    @event.listens_for(engine, "connect")
-    def enable_foreign_keys(connection, record) -> None:
-        del record
-        cursor = connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
 
-    removed_checks = [
-        (table, constraint)
-        for table in Base.metadata.tables.values()
-        for constraint in table.constraints
-        if isinstance(constraint, CheckConstraint)
+@pytest.mark.anyio
+async def test_workflow_calls_tools_and_stops_at_pending_review() -> None:
+    tools = FakeTools()
+    references = FakeReferenceClient()
+    workflow = TriageWorkflow(tools, ExactModel(), reference_client=references)
+
+    result = await workflow.run(workflow_request(tools))
+
+    assert result["status"] == "pending_review"
+    assert result["model_id"] == "test-open-weight-model"
+    assert result["recommendation"]["workflow_status"] == "pending_clinician_review"
+    assert [name for name, _ in tools.calls] == [
+        "validate_vitals",
+        "evaluate_triage_rules",
+        "request_clinician_review",
     ]
-    for table, constraint in removed_checks:
-        table.constraints.remove(constraint)
-    try:
-        Base.metadata.create_all(engine)
-    finally:
-        for table, constraint in removed_checks:
-            table.append_constraint(constraint)
-
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
-    try:
-        yield factory
-    finally:
-        Base.metadata.drop_all(engine)
-        engine.dispose()
+    assert all("commit_approved_queue_update" != name for name, _ in tools.calls)
+    assert result["review_request"]["status"] == "pending"
+    assert references.calls == ["TEST-SYNTHETIC-PROTOCOL"]
+    assert result["reference_retrieval"]["status"] == "succeeded"
 
 
-def create_assessment(factory: sessionmaker[Session]) -> AssessmentVersion:
+@pytest.mark.anyio
+async def test_incomplete_observations_skip_evaluation_and_cannot_resume() -> None:
+    tools = FakeTools(complete=False)
+    references = FakeReferenceClient()
+    workflow = TriageWorkflow(tools, ExactModel(), reference_client=references)
+    result = await workflow.run(workflow_request(tools))
+
+    assert result["status"] == "pending_review"
+    assert result["recommendation"] is None
+    assert [name for name, _ in tools.calls] == [
+        "validate_vitals",
+        "request_clinician_review",
+    ]
+    assert references.calls == []
+    with pytest.raises(ValueError, match="not eligible"):
+        await workflow.commit_approved(
+            result,
+            clinician=AuthenticatedClinician(
+                subject="clinician-1",
+                reference="SYN-CLINICIAN-1",
+                permissions=frozenset({"triage:queue:commit"}),
+            ),
+            approval_id=uuid4(),
+            assessment_number=1,
+            queue_name="SYN-QUEUE-1",
+            idempotency_key="workflow-test-key-0001",
+        )
+
+
+@pytest.mark.anyio
+async def test_resume_rejects_artifacts_for_a_different_assessment() -> None:
+    tools = FakeTools()
+    workflow = TriageWorkflow(
+        tools, ExactModel(), reference_client=FakeReferenceClient()
+    )
+    pending = await workflow.run(workflow_request(tools))
+    pending["evaluation"]["assessment_version_id"] = str(uuid4())
+    clinician = AuthenticatedClinician(
+        subject="clinician-1",
+        reference="SYN-CLINICIAN-1",
+        permissions=frozenset({"triage:queue:commit"}),
+    )
+
+    with pytest.raises(ValueError, match="do not match the assessment"):
+        await workflow.commit_approved(
+            pending,
+            clinician=clinician,
+            approval_id=uuid4(),
+            assessment_number=1,
+            queue_name="SYN-QUEUE-1",
+            idempotency_key="workflow-test-key-0003",
+        )
+
+    assert all(name != "commit_approved_queue_update" for name, _ in tools.calls)
+
+
+@pytest.mark.anyio
+async def test_model_invented_findings_are_rejected_but_review_is_requested() -> None:
+    tools = FakeTools()
+    result = await TriageWorkflow(
+        tools, InventingModel(), reference_client=FakeReferenceClient()
+    ).run(workflow_request(tools))
+
+    assert result["status"] == "pending_review"
+    assert result["error_code"] == "MODEL_OUTPUT_REJECTED"
+    assert result["recommendation"] is None
+    assert tools.calls[-1][0] == "request_clinician_review"
+
+
+@pytest.mark.anyio
+async def test_mcp_timeout_fails_closed_and_still_requests_review() -> None:
+    tools = FakeTools(timeout_validation=True)
+    result = await TriageWorkflow(
+        tools, ExactModel(), reference_client=FakeReferenceClient()
+    ).run(workflow_request(tools))
+
+    assert result["status"] == "pending_review"
+    assert result["error_code"] == "TOOL_TIMEOUT"
+    assert [name for name, _ in tools.calls] == [
+        "validate_vitals",
+        "request_clinician_review",
+    ]
+
+
+@pytest.mark.anyio
+async def test_missing_approved_protocol_skips_evaluation_and_requests_review() -> None:
+    tools = FakeTools()
+    result = await TriageWorkflow(
+        tools, ExactModel(), reference_client=MissingReferenceClient()
+    ).run(workflow_request(tools))
+
+    assert result["status"] == "pending_review"
+    assert result["error_code"] == "PROTOCOL_DOCUMENT_NOT_FOUND"
+    assert result["recommendation"] is None
+    assert result["reference_retrieval"]["status"] == "failed"
+    assert [name for name, _ in tools.calls] == [
+        "validate_vitals",
+        "request_clinician_review",
+    ]
+
+
+def test_workflow_rejects_non_synthetic_observation_references() -> None:
+    tools = FakeTools()
+    data = workflow_request(tools).model_dump()
+    data["observations"][0]["source_reference"] = "REAL-PATIENT-REFERENCE"
+
+    with pytest.raises(ValidationError):
+        WorkflowRequest.model_validate(data)
+
+
+def test_workflow_start_requires_configured_trusted_identity_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRIAGE_WORKFLOW_PRINCIPAL_PROVIDER", "")
+    response = TestClient(app).post(
+        "/workflows/triage",
+        json={
+            "encounter_id": str(uuid4()),
+            "assessment_version_id": str(uuid4()),
+            "protocol_id": "TEST-SYNTHETIC-PROTOCOL",
+            "observations": [],
+            "required_measurements": ["heart_rate"],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Trusted workflow identity provider is not configured"
+
+
+@pytest.mark.anyio
+async def test_approved_resume_calls_protected_commit_tool() -> None:
+    tools = FakeTools()
+    workflow = TriageWorkflow(
+        tools, ExactModel(), reference_client=FakeReferenceClient()
+    )
+    pending = await workflow.run(workflow_request(tools))
+    clinician = AuthenticatedClinician(
+        subject="clinician-1",
+        reference="SYN-CLINICIAN-1",
+        permissions=frozenset({"triage:queue:commit"}),
+    )
+
+    committed = await workflow.commit_approved(
+        pending,
+        clinician=clinician,
+        approval_id=uuid4(),
+        assessment_number=1,
+        queue_name="SYN-QUEUE-1",
+        idempotency_key="workflow-test-key-0002",
+    )
+
+    assert committed["status"] == "committed"
+    assert tools.calls[-1][0] == "commit_approved_queue_update"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    os.getenv("TRIAGE_RUN_OLLAMA_INTEGRATION") != "1",
+    reason="set TRIAGE_RUN_OLLAMA_INTEGRATION=1 with a local Ollama model",
+)
+async def test_local_ollama_model_runs_inside_workflow_graph() -> None:
+    tools = FakeTools()
+    model = OllamaStructuredModel(
+        model_id=os.getenv("TRIAGE_OLLAMA_MODEL", "qwen3:1.7b"),
+        base_url=os.getenv("TRIAGE_OLLAMA_URL", "http://127.0.0.1:11434"),
+        timeout_seconds=180,
+    )
+
+    result = await TriageWorkflow(
+        tools, model, reference_client=FakeReferenceClient()
+    ).run(workflow_request(tools))
+
+    assert result["status"] == "pending_review"
+    assert result["model_id"] == model.model_id
+    assert result["recommendation"] == _expected_draft(
+        EvaluateTriageOutput.model_validate(result["evaluation"])
+    ).model_dump(mode="json")
+    assert [name for name, _ in tools.calls] == [
+        "validate_vitals",
+        "evaluate_triage_rules",
+        "request_clinician_review",
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    os.getenv("TRIAGE_RUN_REAL_MCP_INTEGRATION") != "1"
+    or os.getenv("TRIAGE_RUN_FILESYSTEM_MCP_INTEGRATION") != "1",
+    reason=(
+        "set both integration flags with PostgreSQL, Ollama, Docker, and both MCP servers"
+    ),
+)
+async def test_local_model_mcp_review_and_approved_resume_end_to_end(
+    migrated_test_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with migrated_test_engine.connect() as connection:
+        schema = connection.exec_driver_sql("SELECT current_schema()").scalar_one()
+    monkeypatch.setenv("DATABASE_URL", str(migrated_test_engine.url))
+    monkeypatch.setenv("PGOPTIONS", f"-csearch_path={schema}")
+    monkeypatch.setenv(
+        "TRIAGE_MCP_CLINICAL_EVALUATOR",
+        "fake_evaluator:SyntheticWorkflowEvaluator",
+    )
+    monkeypatch.setenv(
+        "TRIAGE_WORKFLOW_PRINCIPAL_PROVIDER",
+        "fake_evaluator:SyntheticWorkflowPrincipalProvider",
+    )
+    monkeypatch.setenv(
+        "TRIAGE_PROTOCOL_REFERENCE_DIRECTORY",
+        str(Path(__file__).resolve().parent / "fixtures" / "approved_protocols"),
+    )
+    tests_path = str(Path(__file__).resolve().parent)
+    existing_pythonpath = os.getenv("PYTHONPATH", "")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        tests_path + (os.pathsep + existing_pythonpath if existing_pythonpath else ""),
+    )
+    factory: sessionmaker[Session] = create_session_factory(migrated_test_engine)
     with factory.begin() as session:
         patient = PatientRepository(session).create(
-            PatientCreate(synthetic_reference=f"SYN-PATIENT-{uuid4().hex[:12].upper()}")
+            PatientCreate(synthetic_reference=f"SYN-PATIENT-{uuid4().hex.upper()}")
         )
         encounter = EncounterRepository(session).create(patient.id, EncounterCreate())
         assessment = AssessmentRepository(session).create_version(
             encounter.id,
             AssessmentVersionCreate(
-                recommendation="Synthetic assessment",
-                created_by_reference="SYN-SYSTEM-TEST",
+                recommendation="Synthetic integration assessment",
+                created_by_reference="SYN-WORKFLOW-TEST",
             ),
         )
-        session.expunge(assessment)
-        return assessment
 
-
-def synthetic_request(assessment: AssessmentVersion) -> WorkflowStartInput:
-    measured_at = datetime(2026, 10, 14, 16, tzinfo=UTC)
-    readings = [
-        ("heart_rate", "72", "bpm"),
-        ("respiratory_rate", "18", "breaths/min"),
-        ("temperature", "37", "degC"),
-        ("oxygen_saturation", "98", "%"),
-    ]
-    return WorkflowStartInput(
-        encounter_id=assessment.encounter_id,
+    request = WorkflowRequest(
+        encounter_id=encounter.id,
         assessment_version_id=assessment.id,
-        age_months=Decimal("600"),  # noqa: FURB157
+        protocol_id="TEST-SYNTHETIC-PROTOCOL",
         observations=[
-            ClinicalObservation.model_validate(
-                {
-                    "observation_id": f"SYN-OBS-{measurement.upper().replace('_', '-')}",
-                    "measurement": measurement,
-                    "value": value,
-                    "unit": unit,
-                    "measured_at": measured_at,
-                    "source": "device",
-                }
-            )
-            for measurement, value, unit in readings
+            {
+                "measurement": "heart_rate",
+                "value": 72,
+                "unit": "bpm",
+                "measured_at": "2026-10-14T12:00:00Z",
+                "source": "device",
+                "source_reference": "SYN-DEVICE-01",
+            }
         ],
-        evaluated_at=datetime(2026, 10, 14, 16, 1, tzinfo=UTC),
+        required_measurements=[Measurement.HEART_RATE],
     )
-
-
-class EchoModel:
-    model_id = "synthetic-echo-model-v1"
-
-    async def acknowledge(self, result: EvaluateTriageOutput) -> ModelAcknowledgement:
-        return ModelAcknowledgement(
-            evaluator_status=result.status,
-            matched_rule_ids=sorted(
-                finding.rule_id
-                for finding in result.findings
-                if finding.rule_state == "met"
-            ),
+    client = TestClient(app)
+    start_response = client.post("/workflows/triage", json=request.model_dump(mode="json"))
+    assert start_response.status_code == 200, start_response.text
+    result = start_response.json()
+    assert result["status"] == "pending_review"
+    assert result["recommendation"] is not None, result
+    assert result["recommendation"]["finding_codes"] == ["synthetic.fixture"]
+    assert result["review_request"]["status"] == "pending"
+    assert "request" not in result
+    assert "protocol_reference" not in result
+    assert result["reference_retrieval"]["status"] == "succeeded"
+    assert result["protocol_reference_metadata"]["version"] == "test-v1"
+    with factory() as session:
+        review = session.get(
+            ClinicianReviewRequest, UUID(result["review_request"]["request_id"])
         )
-
-
-class MismatchedModel(EchoModel):
-    async def acknowledge(self, result: EvaluateTriageOutput) -> ModelAcknowledgement:
-        del result
-        return ModelAcknowledgement(
-            evaluator_status="evaluated",
-            matched_rule_ids=["invented.rule"],
-        )
-
-
-class TimedOutModel(EchoModel):
-    async def acknowledge(self, result: EvaluateTriageOutput) -> ModelAcknowledgement:
-        del result
-        raise WorkflowFailure("MODEL_TIMEOUT", "synthetic local model timeout")
-
-
-class UnavailableEvaluator:
-    def evaluate(self, data: EvaluateTriageInput) -> EvaluateTriageOutput:
-        del data
-        raise ClinicalEvaluatorUnavailable("synthetic protocol unavailable")
-
-
-def clinician() -> AuthenticatedClinician:
-    return AuthenticatedClinician(
-        subject="synthetic-clinician-subject",
-        reference="SYN-CLINICIAN-TEST",
-        permissions=frozenset({APPROVE_PERMISSION, COMMIT_PERMISSION}),
-    )
-
-
-def create_workflow(
-    factory: sessionmaker[Session],
-    model: EchoModel | None = None,
-    evaluator: ClinicalEvaluator | None = None,
-) -> TriageWorkflow:
-    return TriageWorkflow(
-        factory,
-        TriageToolsService(factory, evaluator),
-        model or EchoModel(),
-    )
-
-
-def test_synthetic_workflow_stops_pending_without_live_queue_change(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    output = asyncio.run(
-        create_workflow(session_factory).start(synthetic_request(assessment))
-    )
-    assert output.status == SYNTHETIC_EXPECTED_PENDING["status"]
-    assert output.validation_result is not None
-    assert output.validation_result.valid is True
-    assert (
-        output.validation_result.complete
-        is SYNTHETIC_EXPECTED_PENDING["validation_complete"]
-    )
-    assert output.evaluation_result is not None
-    assert (
-        output.evaluation_result.status
-        == SYNTHETIC_EXPECTED_PENDING["evaluator_status"]
-    )
-    assert output.recommendation is not None
-    assert output.recommendation.triage_category is None
-    assert output.recommendation.requires_clinician_review is True
-    assert output.review_request_id is not None
-    with session_factory() as session:
-        assert session.scalars(select(QueueEvent)).all() == []
-        workflow_events = session.scalars(
-            select(AuditLog).where(
-                AuditLog.entity_type == AuditEntityType.WORKFLOW_EXECUTION.value
-            )
-        ).all()
-    assert len(workflow_events) >= 5
-
-
-def test_workflow_resumes_with_authorized_clinician_and_commits_once(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    pending = asyncio.run(
-        create_workflow(session_factory).start(synthetic_request(assessment))
-    )
-    workflow = create_workflow(session_factory)
-
-    with pytest.raises(WorkflowFailure, match="lacks approval"):
-        asyncio.run(
-            workflow.resume(
-                pending.workflow_id,
-                AuthenticatedClinician(
-                    subject="unprivileged-clinician",
-                    reference="SYN-CLINICIAN-OTHER",
-                    permissions=frozenset(),
-                ),
-            )
-        )
-
-    completed = asyncio.run(workflow.resume(pending.workflow_id, clinician()))
-    repeated = asyncio.run(workflow.resume(pending.workflow_id, clinician()))
-
-    assert completed.status == SYNTHETIC_EXPECTED_COMMIT["status"]
-    assert any(
-        event.event_type == "workflow.approval.denied" for event in completed.events
-    )
-    assert completed.commit_result is not None
-    assert completed.commit_result.status == SYNTHETIC_EXPECTED_COMMIT["commit_status"]
-    assert repeated.commit_result == completed.commit_result
-    with session_factory() as session:
         queue_events = session.scalars(select(QueueEvent)).all()
-        commits = session.scalars(select(QueueCommit)).all()
-        execution = session.get(WorkflowExecution, pending.workflow_id)
-        tool_executions = session.scalars(select(ToolExecution)).all()
-        tool_audits = session.scalars(
-            select(AuditLog).where(
-                AuditLog.entity_type == AuditEntityType.TOOL_EXECUTION.value
-            )
-        ).all()
-    assert len(queue_events) == SYNTHETIC_EXPECTED_COMMIT["queue_event_count"]
-    assert len(commits) == 1
+        execution = session.get(WorkflowExecution, UUID(result["workflow_id"]))
+    assert review is not None
+    assert queue_events == []
     assert execution is not None
-    assert execution.approval_id == completed.approval_id
-    assert {item.tool_name for item in tool_executions} == {
-        "validate_vitals",
-        "evaluate_triage_rules",
-        "request_clinician_review",
-        "commit_approved_queue_update",
-    }
-    assert all(item.status == "succeeded" for item in tool_executions)
-    assert len(tool_audits) == len(tool_executions)
+    assert execution.status == "pending_review"
+    assert execution.model_identifier == "qwen3:1.7b"
+    assert execution.reference_retrieval["server_identity"] == FILESYSTEM_SERVER_ID
+    assert execution.reference_retrieval["tool_name"] == "read_text_file"
+    assert execution.protocol_reference["version"] == "test-v1"
+    assert execution.evaluation_result["protocol_version"] == "test-v1"
+    assert execution.recommendation_result["finding_codes"] == ["synthetic.fixture"]
 
-
-def test_incomplete_information_is_preserved_as_pending_and_indeterminate(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    request = synthetic_request(assessment).model_copy(update={"observations": []})
-
-    output = asyncio.run(create_workflow(session_factory).start(request))
-
-    assert output.status == "awaiting_clinician_approval"
-    assert output.validation_result is not None
-    assert output.validation_result.valid is True
-    assert output.validation_result.complete is False
-    assert output.evaluation_result is not None
-    assert output.evaluation_result.status == "indeterminate"
-    assert output.evaluation_result.triage_category is None
-    assert output.recommendation is not None
-    assert "no low-acuity conclusion" in output.recommendation.summary
-
-
-def test_model_mismatch_fails_without_creating_review_or_queue_change(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    output = asyncio.run(
-        create_workflow(session_factory, MismatchedModel()).start(
-            synthetic_request(assessment)
-        )
+    resume_response = client.post(
+        f"/workflows/{execution.id}/approve",
+        json={
+            "assessment_number": assessment.version,
+            "queue_name": "SYN-QUEUE-TEST",
+            "idempotency_key": "workflow-live-test-key-0001",
+        },
     )
-
-    assert output.status == "failed"
-    assert output.error_code == "MODEL_OUTPUT_MISMATCH"
-    assert output.review_request_id is None
-    with session_factory() as session:
-        assert session.scalars(select(QueueEvent)).all() == []
-        assert session.scalars(select(QueueCommit)).all() == []
-
-
-def test_model_timeout_fails_closed_without_creating_review(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    output = asyncio.run(
-        create_workflow(session_factory, TimedOutModel()).start(
-            synthetic_request(assessment)
-        )
-    )
-
-    assert output.status == "failed"
-    assert output.error_code == "MODEL_TIMEOUT"
-    assert output.review_request_id is None
-    with session_factory() as session:
-        assert session.scalars(select(QueueEvent)).all() == []
-        workflow_audits = session.scalars(
+    assert resume_response.status_code == 200, resume_response.text
+    assert resume_response.json()["status"] == "committed"
+    with factory() as session:
+        commits = session.scalars(select(QueueCommit)).all()
+        events = session.scalars(select(QueueEvent)).all()
+        approvals = session.scalars(select(ClinicianApproval)).all()
+        reference_audit = session.scalars(
             select(AuditLog).where(
-                AuditLog.entity_type == AuditEntityType.WORKFLOW_EXECUTION.value
+                AuditLog.entity_type == "workflow_execution",
+                AuditLog.entity_id == execution.id,
             )
-        ).all()
-    assert any(row.action == "workflow.failed" for row in workflow_audits)
-
-
-def test_unavailable_evaluator_returns_audited_failure_without_review(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    output = asyncio.run(
-        create_workflow(session_factory, evaluator=UnavailableEvaluator()).start(
-            synthetic_request(assessment)
-        )
-    )
-
-    assert output.status == "failed"
-    assert output.error_code == "EVALUATOR_UNAVAILABLE"
-    assert output.evaluation_result is None
-    assert output.review_request_id is None
-    with session_factory() as session:
-        assert session.scalars(select(QueueEvent)).all() == []
-        failed_tools = session.scalars(
-            select(ToolExecution).where(
-                ToolExecution.tool_name == "evaluate_triage_rules"
-            )
-        ).all()
-        failed_audits = session.scalars(
-            select(AuditLog).where(
-                AuditLog.entity_type == AuditEntityType.TOOL_EXECUTION.value
-            )
-        ).all()
-    assert len(failed_tools) == 1
-    assert failed_tools[0].status == "failed"
-    assert failed_tools[0].error_code == "EVALUATOR_UNAVAILABLE"
-    assert len(failed_audits) == 2
-    assert any(
-        row.action == "tool.evaluate_triage_rules.failed" for row in failed_audits
-    )
-
-
-def test_stale_assessment_is_rejected_on_resume(
-    session_factory: sessionmaker[Session],
-) -> None:
-    assessment = create_assessment(session_factory)
-    workflow = create_workflow(session_factory)
-    pending = asyncio.run(workflow.start(synthetic_request(assessment)))
-    create_assessment_version(session_factory, assessment)
-
-    failed = asyncio.run(workflow.resume(pending.workflow_id, clinician()))
-
-    assert failed.status == "failed"
-    assert failed.error_code == "STALE_ASSESSMENT"
-    with session_factory() as session:
-        assert session.scalars(select(QueueEvent)).all() == []
-
-
-def create_assessment_version(
-    factory: sessionmaker[Session], previous: AssessmentVersion
-) -> None:
-    with factory.begin() as session:
-        AssessmentRepository(session).create_version(
-            previous.encounter_id,
-            AssessmentVersionCreate(
-                recommendation="New synthetic assessment",
-                created_by_reference="SYN-SYSTEM-TEST",
-            ),
-        )
-
-
-def test_model_runtime_requires_loopback_host() -> None:
-    with pytest.raises(ValueError, match="local loopback"):
-        OllamaChatModel(base_url="http://model.example:11434")
-
-
-def test_ollama_model_validates_json_response_and_maps_bad_output() -> None:
-    evaluation = EvaluateTriageOutput(
-        status="indeterminate",
-        assessment_version_id=uuid4(),
-        protocol_id="WHO-IITT-ROUTINE",
-        protocol_version="synthetic-protocol-1",
-        assessment_output_version="1.0.0",
-        findings=[],
-        supporting_evidence=[],
-        missing_information=["heart_rate"],
-        evaluation_uncertainties=[],
-        unsupported_criteria=["synthetic.unsupported"],
-        evaluated_at=datetime.now(UTC),
-    )
-
-    async def valid_handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        assert body["model"] == "qwen2.5:1.5b"
-        assert body["options"]["temperature"] == 0
-        return httpx.Response(
-            200,
-            json={
-                "message": {
-                    "content": '{"evaluator_status":"indeterminate",'
-                    '"matched_rule_ids":[]}'
-                }
-            },
-        )
-
-    model = OllamaChatModel(
-        transport=httpx.MockTransport(valid_handler),
-    )
-    result = asyncio.run(model.acknowledge(evaluation))
-    assert result.evaluator_status == evaluation.status
-    assert result.matched_rule_ids == []
-
-    async def malformed_handler(request: httpx.Request) -> httpx.Response:
-        del request
-        return httpx.Response(200, json={"message": {"content": "not-json"}})
-
-    malformed_model = OllamaChatModel(
-        transport=httpx.MockTransport(malformed_handler),
-    )
-    with pytest.raises(WorkflowFailure) as failure:
-        asyncio.run(malformed_model.acknowledge(evaluation))
-    assert failure.value.code == "MODEL_OUTPUT_INVALID"
-
-    async def timeout_handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("synthetic timeout", request=request)
-
-    timeout_model = OllamaChatModel(
-        transport=httpx.MockTransport(timeout_handler),
-    )
-    with pytest.raises(WorkflowFailure) as failure:
-        asyncio.run(timeout_model.acknowledge(evaluation))
-    assert failure.value.code == "MODEL_TIMEOUT"
-
-
-def test_approval_route_requires_trusted_request_context() -> None:
-    from triage_sentinel.main import approve_workflow
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/workflows/test/approval",
-            "headers": [],
-            "query_string": b"",
-            "state": {},
-        }
-    )
-
-    with pytest.raises(HTTPException) as failure:
-        asyncio.run(approve_workflow(uuid4(), request))
-    assert failure.value.status_code == 401
+        ).one()
+        completed = session.get(WorkflowExecution, execution.id)
+    assert len(approvals) == 1
+    assert len(commits) == 1
+    assert len(events) == 1
+    assert completed is not None
+    assert completed.status == "committed"
+    assert reference_audit.action == "mcp.filesystem.read_text_file.succeeded"

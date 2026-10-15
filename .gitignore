@@ -6,6 +6,31 @@
 !.env.example.*
 !.env.*.example.*
 
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Local credentials and token-bearing config
+.aws/
+.azure/
+.config/gcloud/
+.netrc
+.npmrc
+.pypirc
+credentials.json
+application_default_credentials.json
+*-service-account*.json
+*.secret
+*.credentials
+*.tfstate
+*.tfstate.*
+!*.example
+!*.example.*
+
 # Python
 .venv/
 venv/

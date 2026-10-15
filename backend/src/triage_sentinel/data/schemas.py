@@ -113,7 +113,18 @@ class VitalObservationCreate(DataSchema):
     unit: Unit
     measured_at: AwareDatetime
     source: ObservationSource
-    source_reference: SyntheticReference | None = None
+    source_reference: str | None = None
+
+    @field_validator("source_reference")
+    @classmethod
+    def validate_source_reference(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value.startswith("SYN-"):
+            pattern = r"^SYN-[A-Z0-9][A-Z0-9-]{1,63}$"
+            if not __import__("re").match(pattern, value):
+                raise ValueError("source_reference must match synthetic format")
+        return value
 
     @field_validator("value")
     @classmethod
