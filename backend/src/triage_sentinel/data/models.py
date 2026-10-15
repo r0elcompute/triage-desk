@@ -10,7 +10,6 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
-    JSON,
     Numeric,
     String,
     Text,
@@ -759,69 +758,6 @@ class AuditLog(Base, TimestampMixin):
     actor_reference: Mapped[str] = mapped_column(String(68), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
-    )
-
-
-class WorkflowExecution(Base):
-    __tablename__ = "workflow_executions"
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('received', 'validating', 'evaluating', "
-            "'generating_recommendation', 'requesting_review', "
-            "'awaiting_clinician_approval', 'committing', 'completed', 'failed')",
-            name="ck_workflow_executions_status",
-        ),
-        CheckConstraint(
-            "length(model_id) > 0", name="ck_workflow_execution_model_nonempty"
-        ),
-        CheckConstraint(
-            "assessment_number > 0",
-            name="ck_workflow_execution_assessment_positive",
-        ),
-        CheckConstraint(
-            "input_digest ~ '^[0-9a-f]{64}$'",
-            name="ck_workflow_execution_digest_sha256",
-        ),
-        ForeignKeyConstraint(
-            ["assessment_version_id", "encounter_id"],
-            ["assessment_versions.id", "assessment_versions.encounter_id"],
-            ondelete="RESTRICT",
-            name="fk_workflow_execution_assessment_encounter",
-        ),
-        UniqueConstraint("id", "assessment_version_id"),
-        Index("ix_workflow_execution_status_updated", "status", "updated_at"),
-    )
-
-    id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), primary_key=True, default=uuid4
-    )
-    encounter_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    assessment_version_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), nullable=False
-    )
-    assessment_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    protocol_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    protocol_version: Mapped[str] = mapped_column(String(128), nullable=False)
-    status: Mapped[str] = mapped_column(String(40), nullable=False)
-    input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    queue_name: Mapped[str] = mapped_column(String(64), nullable=False)
-    validation_result: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    evaluation_result: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    recommendation: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    review_request_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("clinician_review_requests.id", ondelete="RESTRICT")
-    )
-    approval_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("clinician_approvals.id", ondelete="RESTRICT")
-    )
-    commit_result: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    error_code: Mapped[str | None] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 

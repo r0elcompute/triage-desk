@@ -13,6 +13,8 @@ type QueueItem = {
   workflow_status: string;
   review_status: string;
   proposed_findings: Finding[];
+  proposed_category: 'red' | 'yellow' | 'green' | null;
+  evaluation_status: string | null;
   protocol_reference: { protocol_id?: string; version?: string } | null;
   error_code: string | null;
   review_request_id: string | null;
@@ -53,6 +55,7 @@ type EncounterDetail = {
   assessments: {
     id: string;
     version: number;
+    created_at: string;
     recommendation: string;
     reviews: {
       id: string;
@@ -66,6 +69,7 @@ type EncounterDetail = {
   workflows: {
     id: string;
     assessment_version_id: string;
+    model_identifier: string;
     status: string;
     started_at: string;
     validation: {
@@ -75,7 +79,9 @@ type EncounterDetail = {
       issues?: { code: string; path: string; message: string }[];
     };
     evaluation: {
+      status?: string;
       protocol_version?: string;
+      triage_category?: 'red' | 'yellow' | 'green' | null;
       findings?: Finding[];
       supporting_evidence?: string[];
     } | null;
@@ -116,12 +122,37 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
     headers: { 'content-type': 'application/json', ...options?.headers },
   });
-  const result = await response.json().catch(() => ({}));
+  const result: unknown = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const detail = typeof result.detail === 'string' ? result.detail : `Request failed (${response.status})`;
-    throw new Error(detail);
+    const detail = result && typeof result === 'object' && 'detail' in result
+      ? result.detail
+      : undefined;
+    throw new Error(formatApiError(detail, response.status));
   }
   return result as T;
+}
+
+function formatApiError(detail: unknown, status: number): string {
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail.flatMap((item) => {
+      if (typeof item === 'string') return [item];
+      if (!item || typeof item !== 'object') return [];
+      const entry = item as Record<string, unknown>;
+      if (typeof entry.msg !== 'string') return [];
+      const path = Array.isArray(entry.loc)
+        ? entry.loc.filter((part) => part !== 'body').join('.')
+        : '';
+      return [`${path ? `${path}: ` : ''}${entry.msg}`];
+    });
+    if (messages.length) return messages.join('; ');
+  }
+  if (detail && typeof detail === 'object') {
+    const entry = detail as Record<string, unknown>;
+    if (typeof entry.message === 'string' && entry.message.trim()) return entry.message;
+    if (typeof entry.code === 'string' && entry.code.trim()) return entry.code;
+  }
+  return `Request failed (${status})`;
 }
 
 function formatDate(value: string) {
@@ -142,6 +173,8 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<EncounterDetail | null>(null);
   const [clinician, setClinician] = useState<DashboardSession | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [sessionError, setSessionError] = useState('');
   const [pageError, setPageError] = useState('');
   const [detailError, setDetailError] = useState('');
   const [loadingQueue, setLoadingQueue] = useState(true);
@@ -165,9 +198,19 @@ export default function Home() {
       setQueue(result);
       const nextSelected = preferredId ?? selectedId;
       if (nextSelected && result.some((item) => item.encounter_id === nextSelected)) {
+        if (nextSelected !== selectedId) {
+          setDetailError('');
+          setLoadingDetail(true);
+        }
         setSelectedId(nextSelected);
-      } else if (!selectedId && result.length) {
+      } else if (result.length) {
+        if (result[0].encounter_id !== selectedId) {
+          setDetailError('');
+          setLoadingDetail(true);
+        }
         setSelectedId(result[0].encounter_id);
+      } else {
+        setSelectedId(null);
       }
       setPageError('');
     } catch (error) {
@@ -193,8 +236,21 @@ export default function Home() {
         if (active) setLoadingQueue(false);
       });
     api<DashboardSession>('dashboard/session')
-      .then((result) => { if (active) setClinician(result); })
-      .catch(() => { if (active) setClinician(null); });
+      .then((result) => {
+        if (active) {
+          setClinician(result);
+          setSessionError('');
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setClinician(null);
+          setSessionError(error instanceof Error ? error.message : 'Session could not be verified.');
+        }
+      })
+      .finally(() => {
+        if (active) setSessionLoading(false);
+      });
     return () => { active = false; };
   }, []);
 
@@ -254,24 +310,40 @@ export default function Home() {
           observations,
         }),
       });
-      const workflow = await api<{ status: string; error_code?: string }>('workflows/triage', {
-        method: 'POST',
-        body: JSON.stringify({
-          encounter_id: intake.encounter_id,
-          assessment_version_id: intake.assessment_version_id,
-          protocol_id: protocolId.trim(),
-          observations,
-          required_measurements: requiredMeasurements,
-        }),
-      });
-      setSuccessMessage(
-        `Encounter created for ${intake.patient_reference}. Workflow status: ${titleCase(workflow.status)}${workflow.error_code ? ` (${workflow.error_code})` : ''}.`,
-      );
+      let workflow: { status: string; error_code?: string } | null = null;
+      let workflowFailure = '';
+      try {
+        workflow = await api<{ status: string; error_code?: string }>('workflows/triage', {
+          method: 'POST',
+          body: JSON.stringify({
+            encounter_id: intake.encounter_id,
+            assessment_version_id: intake.assessment_version_id,
+            protocol_id: protocolId.trim(),
+            observations,
+            required_measurements: requiredMeasurements,
+          }),
+        });
+      } catch (error) {
+        workflowFailure = error instanceof Error ? error.message : 'Workflow execution failed.';
+      }
       setPatientReference('');
       setComplaint('');
       setValues({});
       await refreshQueue(intake.encounter_id);
       setView('queue');
+      if (workflowFailure) {
+        setPageError(
+          `Encounter ${intake.patient_reference} was saved, but the workflow did not complete: ${workflowFailure}. No recommendation was approved.`,
+        );
+      } else if (workflow?.status === 'failed' || workflow?.error_code) {
+        setPageError(
+          `Encounter ${intake.patient_reference} was saved. Workflow stopped with ${workflow?.error_code ?? workflow?.status}; no recommendation was approved.`,
+        );
+      } else {
+        setSuccessMessage(
+          `Encounter created for ${intake.patient_reference}. Workflow status: ${titleCase(workflow?.status ?? 'unknown')}.`,
+        );
+      }
     } catch (error) {
       setPageError(error instanceof Error ? error.message : 'Intake could not be submitted.');
       await refreshQueue();
@@ -283,7 +355,9 @@ export default function Home() {
   const selectedItem = queue.find((item) => item.encounter_id === selectedId);
   const currentWorkflow = detail?.workflows[0];
   const currentAssessment = detail?.assessments[0];
-  const outstandingRequests = detail?.review_requests.filter((item) => item.pending) ?? [];
+  const outstandingRequests = detail?.review_requests.filter(
+    (item) => item.pending && item.assessment_version_id === currentAssessment?.id,
+  ) ?? [];
   const canApprove = Boolean(
     clinician?.can_review &&
       clinician.can_commit_queue &&
@@ -351,7 +425,13 @@ export default function Home() {
         </a>
         <div className="topbar-status">
           <span className={`status-dot ${clinician ? 'status-dot--ready' : ''}`} />
-          <span>{clinician ? clinician.clinician_reference : 'Clinician session unavailable'}</span>
+          <span>
+            {sessionLoading
+              ? 'Checking clinician session…'
+              : clinician
+                ? clinician.clinician_reference
+                : 'Clinician session unavailable'}
+          </span>
         </div>
         <div className="topbar-meta"><span>CLINICAL OPERATIONS</span><span>·</span><span>SYNTHETIC DATA</span></div>
       </header>
@@ -380,7 +460,11 @@ export default function Home() {
           </div>
           {!clinician?.can_run_workflow && (
             <div className="alert alert--warning" role="status">
-              Workflow actions are locked until the backend confirms an authenticated clinician with workflow permission.
+              {sessionLoading
+                ? 'Checking the clinician session with the backend.'
+                : sessionError
+                  ? `Workflow actions are locked because the clinician session could not be verified: ${sessionError}`
+                  : 'Workflow actions are locked until the backend confirms an authenticated clinician with workflow permission.'}
             </div>
           )}
           <form className="intake-form" onSubmit={submitIntake}>
@@ -390,7 +474,7 @@ export default function Home() {
                 <input value={patientReference} onChange={(event) => setPatientReference(event.target.value)} placeholder="SYN-PATIENT-..." pattern="SYN-[A-Z0-9][A-Z0-9-]{1,63}" />
               </label>
               <label className="field">
-                <span>Protocol reference ID</span>
+                <span>Protocol reference ID <small>Verified against approved backend documents</small></span>
                 <input value={protocolId} onChange={(event) => setProtocolId(event.target.value)} required placeholder="Configured protocol ID" />
               </label>
             </div>
@@ -428,7 +512,7 @@ export default function Home() {
               ))}
             </div>
             <div className="form-footer">
-              <p>Intake is persisted by the backend. A protocol evaluation may remain pending if the configured protocol or services are unavailable.</p>
+              <p>Entering an ID does not approve a protocol. If the backend cannot verify the approved source and version, the workflow pauses without producing an authoritative evaluation.</p>
               <button className="button button--primary" type="submit" disabled={submitting || !clinician?.can_run_workflow || requiredMeasurements.length === 0}>
                 {submitting ? 'Submitting…' : 'Create encounter and run workflow'}
               </button>
@@ -452,11 +536,21 @@ export default function Home() {
                   const topFinding = item.proposed_findings[0];
                   return (
                     <li key={item.workflow_id}>
-                      <button className={`queue-item ${selectedId === item.encounter_id ? 'queue-item--selected' : ''}`} type="button" onClick={() => setSelectedId(item.encounter_id)}>
+                      <button className={`queue-item ${selectedId === item.encounter_id ? 'queue-item--selected' : ''}`} type="button" onClick={() => { if (selectedId !== item.encounter_id) { setDetailError(''); setLoadingDetail(true); setSelectedId(item.encounter_id); } }}>
                         <span className="queue-item-top"><strong>{item.patient_reference}</strong><span className={`review-badge review-badge--${item.review_status}`}>{titleCase(item.review_status)}</span></span>
                         <span className="queue-complaint">{item.complaint}</span>
                         <span className="queue-item-bottom">
-                          <span>{topFinding ? `${titleCase(topFinding.severity)} finding` : item.error_code ? 'Evaluation unavailable' : 'No proposed finding'}</span>
+                          <span>
+                            {item.proposed_category
+                              ? `Proposed ${titleCase(item.proposed_category)} category`
+                              : topFinding
+                                ? `${titleCase(topFinding.severity)} finding`
+                                : item.evaluation_status
+                                  ? `Evaluation: ${titleCase(item.evaluation_status)}`
+                                  : item.error_code
+                                    ? 'Evaluation unavailable'
+                                    : 'No proposed finding'}
+                          </span>
                           <time>{formatDate(item.started_at)}</time>
                         </span>
                       </button>
@@ -485,7 +579,7 @@ export default function Home() {
                 {selectedItem?.error_code && <div className="alert alert--warning" role="status">Backend workflow stopped safely: {selectedItem.error_code}. Review the available evidence; no recommendation was approved.</div>}
 
                 <div className="decision-strip">
-                  <div className="decision-block decision-block--proposed"><span className="decision-label">PROPOSED / BACKEND</span><strong>{currentWorkflow?.recommendation?.summary ?? 'No proposed recommendation available'}</strong><small>{currentWorkflow?.protocol_reference?.protocol_id ? `${currentWorkflow.protocol_reference.protocol_id} · ${currentWorkflow.protocol_reference.version ?? 'version unavailable'}` : 'Protocol reference unavailable'}</small></div>
+                  <div className="decision-block decision-block--proposed"><span className="decision-label">PROPOSED / BACKEND</span><strong>{currentWorkflow?.recommendation?.summary ?? 'No proposed recommendation available'}</strong><small>{currentWorkflow?.evaluation?.triage_category ? `Proposed ${titleCase(currentWorkflow.evaluation.triage_category)} category · ` : ''}{currentWorkflow?.protocol_reference?.protocol_id ? `${currentWorkflow.protocol_reference.protocol_id} · ${currentWorkflow.protocol_reference.version ?? 'version unavailable'}` : 'Protocol reference unavailable'}</small></div>
                   <div className="decision-block decision-block--approved"><span className="decision-label">CLINICIAN DECISION</span><strong>{currentAssessment.reviews[0] ? titleCase(currentAssessment.reviews[0].decision) : 'Not reviewed'}</strong><small>{currentAssessment.reviews[0] ? `${currentAssessment.reviews[0].clinician_reference} · ${formatDate(currentAssessment.reviews[0].reviewed_at)}` : 'No approval or override recorded'}</small></div>
                 </div>
 
@@ -504,7 +598,7 @@ export default function Home() {
                         <div className="observation-row" key={observation.id}>
                           <div><strong>{titleCase(observation.measurement)}</strong><small>{observation.source} · {observation.source_reference ?? 'No source reference'}</small></div>
                           <div className="observation-value"><strong>{observation.value}</strong><span>{observation.unit}</span></div>
-                          <div className="observation-time"><time>{formatDate(observation.measured_at)}</time><span className="freshness-unknown">Freshness rule not returned</span></div>
+                          <div className="observation-time"><time>{formatDate(observation.measured_at)}</time><span className="freshness-unknown">Freshness unknown · backend has no outdated status</span></div>
                         </div>
                       ))}
                       {detail.observations.length === 0 && <p className="muted-copy">No observations were recorded for this encounter.</p>}
@@ -552,8 +646,8 @@ export default function Home() {
                 <section className="history-section">
                   <div className="section-heading section-heading--compact"><div><p className="eyebrow">RECORD</p><h3>Assessment & audit history</h3></div><span className="count-label">{detail.audit_history.length} events</span></div>
                   <div className="history-list">
-                    {detail.assessments.map((assessment) => <div className="history-row" key={assessment.id}><span className="history-marker" /><div><strong>Assessment version {assessment.version}</strong><small>{assessment.recommendation}</small></div><span>{assessment.reviews.length ? `${assessment.reviews.length} clinician decision(s)` : 'No decision'}</span></div>)}
-                    {detail.workflows.flatMap((workflow) => workflow.transitions.map((transition, index) => <div className="history-row" key={`${workflow.id}-${index}`}><span className="history-marker history-marker--workflow" /><div><strong>{titleCase(transition.state)}</strong><small>Workflow {workflow.id.slice(0, 8)}</small></div><time>{formatDate(transition.at)}</time></div>))}
+                    {detail.assessments.map((assessment) => <div className="history-row" key={assessment.id}><span className="history-marker" /><div><strong>Assessment v{assessment.version} · {assessment.reviews[0] ? titleCase(assessment.reviews[0].decision) : 'No clinician decision'}</strong><small>{assessment.recommendation || 'No recommendation recorded'}</small></div><time>{formatDate(assessment.created_at)}</time></div>)}
+                    {detail.workflows.flatMap((workflow) => workflow.transitions.map((transition, index) => <div className="history-row" key={`${workflow.id}-${index}`}><span className="history-marker history-marker--workflow" /><div><strong>Workflow · {titleCase(transition.state)}</strong><small>{workflow.model_identifier}</small></div><time>{formatDate(transition.at)}</time></div>))}
                     {detail.audit_history.map((event, index) => <div className="history-row" key={`${event.action}-${event.occurred_at}-${index}`}><span className="history-marker history-marker--audit" /><div><strong>{titleCase(event.action)}</strong><small>{event.actor_reference}</small></div><time>{formatDate(event.occurred_at)}</time></div>)}
                   </div>
                 </section>

@@ -667,4 +667,3 @@ def persist_workflow_execution(
 
 def _reference_metadata(reference: ProtocolReferenceInput) -> dict[str, Any]:
     return reference.model_dump(exclude={"content"})
-

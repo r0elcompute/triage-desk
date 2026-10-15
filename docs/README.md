@@ -53,10 +53,12 @@ schemas for:
   finite values, timezone-aware measurement times, and the measurements
   explicitly required by the caller.
 - `evaluate_triage_rules`: calls the configured deterministic evaluator and
-  returns its findings, evidence, and protocol version. No clinical evaluator
-  exists in this checkout, so the tool returns
-  `EVALUATOR_NOT_CONFIGURED` until one is provided. Clinical logic belongs in
-  the backend evaluator, not in the MCP tool handlers.
+  returns its findings, evidence, and protocol version. No evaluator adapter
+  is configured for production. A limited deterministic IITT evaluator exists
+  in `triage_sentinel.evaluation.iitt`, but its required age/complaint context
+  and result statuses do not currently match the MCP schemas; the latest test
+  observed `INTERNAL_ERROR`. Clinical logic belongs in the backend evaluator,
+  not in MCP tool handlers. Do not infer missing evaluator inputs.
 - `request_clinician_review`: creates an immutable pending request for the
   exact assessment version; it does not write a queue event.
 - `commit_approved_queue_update`: writes a queue-entry event only after the
@@ -90,7 +92,7 @@ review/approval/commit tables are added by Alembic revision
 
 ## Stage 5 LangGraph workflow
 
-`backend/src/triage_sentinel/workflow.py` defines a single explicit LangGraph
+`backend/src/triage_sentinel/workflow/service.py` defines a single explicit LangGraph
 workflow. It validates synthetic input through `validate_vitals`, calls the
 configured deterministic `evaluate_triage_rules` MCP tool only when validation
 is valid and complete, requests a structured Ollama response, checks that the
@@ -121,8 +123,10 @@ and current assessment version. The model cannot approve or commit.
 Ollama is the selected local inference runtime adapter. The default model is
 `qwen3:1.7b`; the official Ollama catalog listed it at approximately 1.4 GB on
 2026-10-14. This container exposed 2 vCPUs, 7.8 GiB RAM, and no GPU runtime.
-Ollama ran in Docker and the model completed synthetic integration tests; this
-does not assess clinical quality or production performance. Set
+An earlier opt-in integration run completed 39 tests with Ollama in Docker;
+a later run failed with `MODEL_UNAVAILABLE`. This historical success does not
+establish that the model is available in the current checkout, and neither run
+assesses clinical quality or production performance. Set
 `TRIAGE_OLLAMA_MODEL` and `TRIAGE_OLLAMA_URL` to configure another local Ollama
 model/server. Inference/network failures create a pending review request when
 possible, but do not produce a recommendation or allow the workflow to resume
@@ -178,10 +182,10 @@ review before redistribution if required.
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for the data flow and [EVALS.md](../EVALS.md)
 for commands and actual results.
 
-The clinical evaluator remains unconfigured in this repository. Therefore the
-workflow can be exercised with synthetic fakes, but it cannot complete an
-operational clinical evaluation or an approved queue commit without the
-separately authorized IITT evaluator, identity provider, PostgreSQL database,
-and local inference runtime. The project is a competition prototype, not a
-clinically validated or approved medical device. Direct clinician assessment
-and emergency response must not be delayed by this workflow.
+The production-approved registry is empty, no trusted identity provider is
+configured, the latest local model check failed, and the MCP/evaluator schema
+contract is incompatible. Therefore the workflow cannot complete an
+operational clinical evaluation or approved queue commit in this checkout.
+The project is a competition prototype, not a clinically validated or approved
+medical device. Direct clinician assessment and emergency response must not be
+delayed by this workflow.

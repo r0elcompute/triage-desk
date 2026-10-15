@@ -354,7 +354,8 @@ async def get_dashboard_queue() -> list[dict[str, Any]]:
                 .order_by(ClinicianReviewRequest.created_at.desc())
                 .limit(1)
             )
-            findings = (execution.evaluation_result or {}).get("findings", [])
+            evaluation = execution.evaluation_result or {}
+            findings = evaluation.get("findings", [])
             rows.append(
                 {
                     "workflow_id": str(execution.id),
@@ -377,6 +378,8 @@ async def get_dashboard_queue() -> list[dict[str, Any]]:
                         else execution.status
                     ),
                     "proposed_findings": findings,
+                    "proposed_category": evaluation.get("triage_category"),
+                    "evaluation_status": evaluation.get("status"),
                     "protocol_reference": execution.protocol_reference,
                     "error_code": execution.error_code,
                     "review_request_id": str(pending_request.id)
@@ -486,6 +489,7 @@ async def get_dashboard_encounter(encounter_id: UUID) -> dict[str, Any]:
                 {
                     "id": str(item.id),
                     "version": item.version,
+                    "created_at": item.created_at.isoformat(),
                     "recommendation": item.recommendation,
                     "reviews": sorted(
                         [
@@ -522,6 +526,7 @@ async def get_dashboard_encounter(encounter_id: UUID) -> dict[str, Any]:
                 {
                     "id": str(item.id),
                     "assessment_version_id": str(item.assessment_version_id),
+                    "model_identifier": item.model_identifier,
                     "status": item.status,
                     "started_at": item.started_at.isoformat(),
                     "validation": item.validation_result,

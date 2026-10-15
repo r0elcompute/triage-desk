@@ -1,210 +1,253 @@
 # Triage Sentinel
 
-Triage Sentinel is the foundation for a healthcare triage MVP. This repository
-contains a Next.js frontend, a FastAPI backend, and the Stage 4
-`triage-tools-mcp` server. The frontend health check remains a connectivity
-check; the repository does not provide medical advice or ship a clinical
-evaluator.
+Triage Sentinel is a synthetic-data, clinician-supervised triage workflow
+prototype. It combines a Next.js dashboard, FastAPI backend, a deterministic
+subset of the WHO/ICRC/MSF routine IITT protocol, a custom MCP tool server, a
+LangGraph workflow, a local Ollama adapter, and an external Filesystem MCP
+reference reader.
+
+It is not a medical device and is not clinically validated. It does not
+diagnose, prescribe, or independently approve an action. An absent escalation
+finding is not a finding that a patient is safe. The approved clinical protocol
+registry is empty, and the current MCP/evaluator schema mismatch prevents
+reliable end-to-end deterministic evaluation. Do not use this prototype for
+patient care.
+
+## Competition submission status
+
+The repository contains the requested architecture and evaluation
+documentation, an MIT license for project-authored material, and an offline
+workflow trace script. It is **not yet submission-ready**:
+
+- This environment has no configured test PostgreSQL database, Ollama,
+  Docker, trusted clinician identity provider, or approved clinical protocol.
+- The latest backend suite recorded **54 passed, 7 skipped, 1 failed, 14
+  errors**. The details and the genuine MCP/evaluator failure are in
+  [EVALS.md](./EVALS.md) and [docs/STAGE9_AUDIT.md](./docs/STAGE9_AUDIT.md).
+- The video requirement is not met. No recording was made; an offline trace
+  using test doubles is not a real live model/MCP demonstration.
+- The borrowed Filesystem MCP package's precise license terms remain
+  unresolved; review [ARCHITECTURE.md](./ARCHITECTURE.md) before distributing
+  it.
+
+The competition checklist below evaluates the requirements provided to this
+project; no separate competition rulebook was supplied.
+
+| Requirement                                                                   | Current evidence                                                                             | Status                                               |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Purpose, setup, configuration, limitations                                    | This README                                                                                  | Documented                                           |
+| Architecture, workflow, MCP, model, approval/audit                            | [ARCHITECTURE.md](./ARCHITECTURE.md)                                                         | Documented with known defects                        |
+| Ten or more synthetic scenarios and actual results                            | [EVALS.md](./EVALS.md), detailed Stage 9 matrix                                              | Documented; failures remain                          |
+| OSI-approved license                                                          | [LICENSE](./LICENSE) (MIT, project-authored work only)                                       | Added; third-party terms still apply                 |
+| Demonstration script                                                          | `python scripts/demo_workflow.py`                                                            | Offline graph trace only; test doubles               |
+| Unedited video under three minutes with visible real tool calls and a failure | None recorded                                                                                | **Blocked**                                          |
+| Custom MCP server                                                             | Four tools discovered; `validate_vitals` executed and audit persisted using temporary SQLite | Partial; PostgreSQL and evaluation path not verified |
+| Filesystem MCP server                                                         | Discovery attempted                                                                          | **Blocked**: Docker executable unavailable           |
+| Clean-checkout execution and local model completion                           | Not verified in this environment                                                             | **Blocked**                                          |
 
 ## Prerequisites
 
-- Node.js 20.19 or newer and npm
-- Python 3.11 or newer
-- PostgreSQL 15 or newer
+For the application and tests:
 
-PostgreSQL is required for the Stage 2 data layer and repository tests.
-Supabase and orchestration remain optional integrations. See
-[docs/README.md](./docs/README.md) for the selected protocol, evaluator
-limitations, MCP setup, tool details, and identity-provider configuration.
+- Python 3.11 or later
+- Node.js 20.19 or later and npm
+- PostgreSQL 15 or later
+- Git
+
+For the optional integrations:
+
+- Ollama and the configured local Qwen3 1.7B open-weight model (upstream model
+  card declares Apache-2.0; the Ollama artifact itself is not digest-pinned)
+- Docker for the pinned Filesystem MCP container
+- A trusted backend clinician identity provider
+- An explicitly authorized protocol entry and a compatible configured
+  deterministic evaluator
+
+The project has no one-command full-stack launcher: these integrations need
+separate configuration and some are intentionally unavailable by default.
 
 ## Setup
 
-From the repository root, create and activate a Python virtual environment and
-install the backend, development, MCP, and workflow dependencies:
+Commands below use PowerShell on Windows. Create local virtual environment and
+install the backend, database driver, MCP, orchestration, and test dependencies:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e "backend[dev,database,mcp]"
+python -m pip install -e "backend[dev,database,orchestration]"
 ```
 
-In another terminal, install the frontend dependencies and create its local
-environment file:
+Install the frontend:
 
-```bash
-cd frontend
-cp .env.example .env.local
+```powershell
+Copy-Item frontend\.env.example frontend\.env.local
+Push-Location frontend
 npm ci
+Pop-Location
 ```
 
-The backend reads `backend/.env` when started from the `backend` directory.
-Copy its example if you want to customize the defaults:
+Copy the backend example configuration:
 
-```bash
-cp backend/.env.example backend/.env
+```powershell
+Copy-Item backend\.env.example backend\.env
 ```
 
-Stage 5 uses a local Ollama-compatible server. Install Ollama separately, then
-pull the default small model and start its server:
+Set `DATABASE_URL` in `backend\.env` to a local PostgreSQL database, then
+apply the schema migrations:
 
-```bash
+```powershell
+Push-Location backend
+python -m alembic upgrade head
+Pop-Location
+```
+
+Database-backed tests require a dedicated disposable PostgreSQL database whose
+name includes `test`. Set `TEST_DATABASE_URL` in the current shell before
+running them. The test fixture migrates an isolated schema and removes it
+afterward.
+
+## Run locally
+
+Start FastAPI in one terminal:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+Set-Location backend
+python -m uvicorn triage_sentinel.main:app --reload
+```
+
+Start Next.js in another:
+
+```powershell
+Set-Location frontend
+npm run dev
+```
+
+Open <http://localhost:3000>. Backend health is at
+<http://localhost:8000/health>. Without database configuration the queue
+returns an explicit service error. Without a trusted identity provider,
+workflow session/start endpoints fail closed; this is expected, not a
+successful clinical workflow.
+
+The backend MCP server is installed as the `triage-tools-mcp` command and is
+started by the workflow over stdio:
+
+```powershell
+python -m pip install -e "backend[mcp,database]"
+triage-tools-mcp
+```
+
+The standalone command expects a configured `DATABASE_URL`. It does not expose
+arbitrary database access. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the
+four typed tools and trust boundaries.
+
+### Optional local model and reference MCP
+
+Install Ollama separately, pull the configured model, and start its service:
+
+```powershell
 ollama pull qwen3:1.7b
 ollama serve
 ```
 
-The default model is listed by Ollama at about 1.4 GB; actual CPU inference
-speed depends on the host. Configure `TRIAGE_OLLAMA_MODEL` and
-`TRIAGE_OLLAMA_URL` in `backend/.env` as needed. Configure
-`TRIAGE_WORKFLOW_PRINCIPAL_PROVIDER` to a trusted backend callable that derives
-an `AuthenticatedClinician` from the authenticated FastAPI request; never trust
-identity or permissions supplied in workflow JSON. The clinician principal
-provider and evaluator are not bundled, so workflow start and queue commits
-remain disabled until trusted integrations are configured.
+Configure `TRIAGE_OLLAMA_MODEL` and `TRIAGE_OLLAMA_URL` in `backend\.env`.
+This repository does not install or launch Ollama.
 
-Environment files are ignored by Git. Do not put secrets in tracked files.
-Set `DATABASE_URL` in `backend/.env` to a PostgreSQL connection string.
+Build the external Filesystem MCP image from the repository root:
 
-Create a local application database and a separate test database, for example:
-
-```bash
-createdb triage_sentinel
-createdb triage_sentinel_test
-```
-
-Set `TEST_DATABASE_URL` to the test database connection string before running
-tests. Repository tests refuse a non-PostgreSQL URL or a database whose name
-does not include `test`; they create and remove an isolated temporary schema.
-
-Apply migrations from the backend directory:
-
-```bash
-cd backend
-python -m alembic upgrade head
-```
-
-To roll back the current migration:
-
-```bash
-python -m alembic downgrade -1
-```
-
-## Run the applications
-
-Start the backend from the repository root (in the activated Python
-environment):
-
-```bash
-cd backend
-python -m uvicorn triage_sentinel.main:app --reload
-```
-
-Start the frontend in a second terminal:
-
-```bash
-cd frontend
-npm run dev
-```
-
-Open <http://localhost:3000>. The landing page requests the frontend's
-same-origin `/api/health` proxy, which checks the backend's `/health` endpoint
-and displays whether the connection succeeded. The backend health endpoint is
-also available directly at <http://localhost:8000/health>.
-
-Set `TRIAGE_API_URL` in `frontend/.env.local` to change the backend URL. Set
-`CORS_ORIGINS` in `backend/.env` to a comma-separated list of allowed browser
-origins for direct API access.
-
-The Stage 5 endpoints are `POST /workflows/triage` to start an evaluation and
-create a pending review, and `POST /workflows/{workflow_id}/approve` to resume
-after independent clinician authentication and authorization. A workflow
-cannot commit when input validation, deterministic evaluation, or structured
-model-output validation fails. The model only formats values returned by MCP;
-it cannot set clinical findings or approve an action. The implementation is a
-competition prototype, not a clinically validated or approved medical device.
-The selected clinical setting and protocol limitations are documented in
-[docs/README.md](./docs/README.md).
-
-## Stage 6 Filesystem MCP
-
-Stage 6 uses the official `@modelcontextprotocol/server-filesystem` npm package
-at exact version `1.0.0`, with a committed npm lockfile and immutable Node base
-image. Build its isolated runtime image from the repository root:
-
-```bash
+```powershell
 docker build -t triage-filesystem-mcp:1.0.0 backend/filesystem-mcp
 ```
 
-Set `TRIAGE_PROTOCOL_REFERENCE_DIRECTORY` to the dedicated
-`docs/clinical-protocols/approved` directory; its example value assumes the
-backend is started from `backend/`. The Docker child has no network, a read-only
-root filesystem, dropped capabilities, and a read-only bind mount of that
-directory at `/protocols`. Although the official server exposes write-capable
-tools, the workflow invokes only `read_text_file` and verifies that the server
-allows only `/protocols`. Running it requires Docker daemon access, which is
-privileged and must be restricted to the trusted backend runtime.
+Set `TRIAGE_PROTOCOL_REFERENCE_DIRECTORY` to
+`..\docs\clinical-protocols\approved` when the backend process working
+directory is `backend\`, or use an absolute path, and set
+`TRIAGE_FILESYSTEM_MCP_IMAGE` to the image tag. The
+registry is intentionally empty; a real clinical reference will not be
+substituted.
 
-Each workflow request supplies a `protocol_id`. The server reads the registry
-and selected UTF-8 document through MCP, checks approval status, version, safe
-relative path, and SHA-256, then passes the verified text only to the
-deterministic evaluator. Document contents are not sent to the language model.
-The approved registry is intentionally empty because this checkout has no
-verified/authorized clinical protocol; such requests fail closed to clinician
-review. The successful sample is a non-clinical test fixture only.
+## Configuration
 
-Build the image, then run actual external-server security and retrieval tests:
+| Variable                              | Purpose                             | Default / state                               |
+| ------------------------------------- | ----------------------------------- | --------------------------------------------- |
+| `DATABASE_URL`                        | Application and MCP persistence     | Must point to local PostgreSQL                |
+| `TEST_DATABASE_URL`                   | Disposable PostgreSQL test database | Not configured by default                     |
+| `CORS_ORIGINS`                        | Allowed browser origins             | Localhost ports 3000                          |
+| `TRIAGE_WORKFLOW_PRINCIPAL_PROVIDER`  | Trusted FastAPI identity provider   | Unset; required for workflow start            |
+| `TRIAGE_MCP_PRINCIPAL_PROVIDER`       | Trusted MCP-side principal provider | Unset; commit fails closed                    |
+| `TRIAGE_MCP_CLINICAL_EVALUATOR`       | Evaluator object `module:attribute` | Unset; MCP contract also needs reconciliation |
+| `TRIAGE_OLLAMA_URL`                   | Local Ollama API endpoint           | `http://127.0.0.1:11434`                      |
+| `TRIAGE_OLLAMA_MODEL`                 | Local open-weight model identifier  | `qwen3:1.7b`                                  |
+| `TRIAGE_MCP_COMMAND`                  | Custom MCP executable               | `triage-tools-mcp`                            |
+| `TRIAGE_PROTOCOL_REFERENCE_DIRECTORY` | Read-only reference directory       | See `backend/.env.example`                    |
+| `TRIAGE_FILESYSTEM_MCP_IMAGE`         | Pinned reference MCP image tag      | `triage-filesystem-mcp:1.0.0`                 |
+| `TRIAGE_API_URL`                      | Frontend proxy backend destination  | `http://127.0.0.1:8000`                       |
 
-```bash
-docker build -t triage-filesystem-mcp:1.0.0 backend/filesystem-mcp
-TRIAGE_RUN_FILESYSTEM_MCP_INTEGRATION=1 python -m pytest -q tests/test_reference_mcp.py
-```
+Local `.env` files are ignored by Git. Keep credentials and private data out of
+the repository. The proxy and model URLs are configurable; do not set them to
+untrusted remote hosts, especially where authorization headers could be
+forwarded.
 
-The complete workflow test additionally requires PostgreSQL, Ollama, and the
-test-only synthetic evaluator/principal. See [EVALS.md](./EVALS.md) for the
-exact command and observed results, and [ARCHITECTURE.md](./ARCHITECTURE.md) for
-the execution and security boundaries.
+## Checks
 
-## Tests and quality checks
+```powershell
+# From the repository root
+$env:TEST_DATABASE_URL = "postgresql+psycopg://localhost:5432/triage_sentinel_test"
+python -m pytest -q
 
-Run backend tests from the repository root:
-
-```bash
-export TEST_DATABASE_URL=postgresql+psycopg://localhost:5432/triage_sentinel_test
-python -m pytest
-```
-
-Run frontend linting, type-checking, and production build from `frontend`:
-
-```bash
+# From frontend/
 npm run lint
 npm run typecheck
 npm run build
 ```
 
-Check formatting for supported files from the repository root with:
+An offline LangGraph control-flow trace is available with:
 
-```bash
-./frontend/node_modules/.bin/prettier --check .
+```powershell
+python scripts/demo_workflow.py
 ```
 
-## Optional backend dependency groups
+It uses in-memory test doubles for MCP and the model, and is explicitly **not**
+evidence that Ollama or either MCP server is available. Actual results and
+limitations are summarized in [EVALS.md](./EVALS.md).
 
-Install only the integrations needed by later stages:
+## Troubleshooting
 
-```bash
-python -m pip install -e "backend[database]"       # Psycopg PostgreSQL driver
-python -m pip install -e "backend[supabase]"       # Supabase Python client
-python -m pip install -e "backend[orchestration]" # LangGraph
-python -m pip install -e "backend[mcp]"           # Python MCP SDK
-```
+- **`Workflow persistence is not configured`**: set `DATABASE_URL`, start
+  PostgreSQL, and apply Alembic migrations.
+- **`Trusted workflow identity provider is not configured`**: provide a
+  backend-trusted provider; never supply clinician identity through request
+  fields or model output.
+- **`EVALUATOR_NOT_CONFIGURED` or MCP `INTERNAL_ERROR`**: the production
+  evaluator is not configured and the present MCP/evaluator schemas are
+  incompatible. Do not add inferred age or complaint data to work around it.
+- **`FILESYSTEM_MCP_UNAVAILABLE`**: install/start Docker, build the pinned
+  image, and check the approved reference directory. The registry being empty
+  is an intentional fail-closed condition.
+- **Ollama connection/model errors**: start Ollama locally and confirm
+  `ollama list` includes the exact configured model.
+- **Test fixture errors**: configure a dedicated PostgreSQL database through
+  `TEST_DATABASE_URL`; SQLite is not a substitute for repository integration
+  tests.
 
-The persistence repositories are deliberately not connected to API routes.
-No clinical evaluator or authenticated principal provider is bundled. The MCP
-triage evaluator and consequential queue tool fail closed until configured.
+## Known limitations
 
-## Repository layout
-
-- `frontend/` — Next.js application
-- `backend/` — FastAPI application and Python project configuration
-- `docs/` — architecture and stage scope
-- `tests/` — backend API tests
+- No production identity provider, approved clinical protocol registry entry,
+  or live production evaluator is configured.
+- `EvaluateTriageInput` in the MCP schema omits context required by the
+  deterministic IITT evaluator, and the MCP result schema cannot represent all
+  evaluator statuses. The current MCP evaluation path has a genuine failing
+  test.
+- Dashboard queue/detail reads currently lack authentication.
+- Synthetic intake accepts free text that can contain sensitive-looking
+  strings.
+- The unused `workflow.engine` / `workflow.repository` path does not match the
+  active ORM model and needs repair or decommissioning.
+- The full backend suite is not green; database-dependent tests were blocked
+  in the latest run.
+- The latest live Ollama integration attempt failed with `MODEL_UNAVAILABLE`;
+  an earlier successful run is historical only.
+- Exact license terms for the borrowed Filesystem MCP package are unresolved.
+- No clean-checkout run or qualifying demo video has been produced for this
+  submission.

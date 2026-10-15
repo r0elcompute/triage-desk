@@ -1,62 +1,180 @@
-# Stage 5 Workflow Architecture
+# Triage Sentinel Architecture
 
-## Runtime path
+## Scope and trust boundaries
 
-1. `POST /workflows/triage` requires a trusted `TRIAGE_WORKFLOW_PRINCIPAL_PROVIDER` and `triage:workflow:run` permission. The provider derives the clinician principal from the authenticated FastAPI request; request JSON cannot supply identity or permissions.
-2. The request schema accepts synthetic encounter identifiers and observation payloads only. Workflow state begins with an explicit `received` status.
-3. A LangGraph validation node calls the existing `validate_vitals` MCP tool over stdio. Invalid, incomplete, unavailable, or timed-out validation branches directly to clinician review; the deterministic evaluator is not called.
-4. Valid and complete observations call `evaluate_triage_rules` through the same stdio MCP server. A tool error or timeout goes to clinician review without asking the model to supply clinical results.
-5. The Ollama adapter (`POST /api/chat`) receives only the structured deterministic evaluation. Its JSON response is validated against `RecommendationDraft` and compared field-for-field against the expected tool-derived structure. Additional or changed claims reject the draft.
-6. The workflow calls `request_clinician_review`. This tool creates a pending request and does not create a queue event. A workflow execution row records the final state, model identifier, transitions, action IDs, validation gates, and input/result SHA-256 digests, not raw intake payloads.
-7. `POST /workflows/{workflow_id}/approve` requires both assessment-approval and queue-commit permissions from a fresh trusted identity-provider result. It checks the persisted workflow gates and the current assessment version, then calls `TriageToolsService.approve_review_request` for that exact review request.
-8. The backend starts a child `triage-tools-mcp` stdio process with the authenticated clinician principal injected through its private process environment. The MCP tool independently checks permission, principal/approval equality, exact current assessment version, revocation, and idempotency before writing a queue event. The backend records the MCP commit action ID and marks the workflow committed only after a valid tool result.
+This is a clinician-supervised engineering prototype using synthetic
+encounters. It is not a medical device. It does not diagnose, prescribe, infer
+that a person is safe, or independently change a live queue. The protocol
+registry at `docs/clinical-protocols/approved/registry.json` is empty, so a
+production-approved clinical reference is not available.
 
-## State transitions
+```text
+Clinician browser
+    |
+    v
+Next.js dashboard ---- same-origin proxy ----> FastAPI
+                                               |  \
+                                               |   \-- SQLAlchemy/PostgreSQL
+                                               |
+                                               +-- LangGraph, single workflow
+                                                     |-- custom triage-tools-mcp (stdio)
+                                                     |-- official Filesystem MCP (Docker/stdio)
+                                                     `-- local Ollama HTTP API
+```
 
-`received -> validating -> validated -> evaluating -> evaluated -> generating_recommendation -> recommendation_validated -> requesting_clinician_review -> pending_clinician_review`
+The frontend contains no clinical rules and no direct database driver. The
+backend owns authentication, workflow execution, persistence, and consequential
+action checks. The two MCP servers are subprocesses, not network endpoints
+exposed to the browser.
 
-Validation/evaluation/model failures take a branch to `requesting_clinician_review`; if that request fails, the workflow ends as `failed`. A pending state is eligible for resume only if validation was valid and complete, an evaluator action exists, a model draft passed exact schema/content validation, and a review request exists. A rejected or failed commit does not become an approved action.
+## Components
 
-## Failure behavior
+- **Next.js / TypeScript dashboard** (`frontend/`): synthetic intake, proposed
+  assessment queue, observation/evidence detail, review controls, history, and
+  visible error/pending states. It calls the backend through a same-origin
+  proxy. Current audit finding: queue and detail GET routes do not authenticate.
+- **FastAPI backend** (`backend/src/triage_sentinel/`): health, workflow, and
+  dashboard API routes. A trusted clinician principal provider is expected for
+  workflow and approval paths; none is configured by default.
+- **PostgreSQL data layer**: encounters, observations, assessment versions,
+  workflow executions, review requests, approvals, queue events, tool
+  executions, and audit events. Local development and test databases must be
+  separate.
+- **Deterministic evaluator** (`evaluation/iitt.py`): encodes a documented,
+  limited subset of WHO/ICRC/MSF routine IITT adult and pediatric vital-sign
+  rules. Rule references, evidence, uncertainty, missing fields, and unsupported
+  criteria are represented. No category is inferred from an absence of
+  escalation. The source snapshot and reuse limitations are in
+  [WHO-IITT.md](./docs/clinical-protocols/WHO-IITT.md).
+- **LangGraph**: one stateful graph, not a multi-agent system. The package
+  metadata installed in the audit environment identifies LangGraph 1.2.15 as
+  MIT-licensed. This verifies an open-source orchestration dependency, not
+  end-to-end execution on a clean checkout.
+- **Ollama adapter**: the workflow sends structured evaluator output to a
+  local Ollama-compatible endpoint; configured model defaults to
+  `qwen3:1.7b`. The model may format a recommendation draft only. Its output
+  must exactly match the deterministic tool result; it cannot create findings,
+  evidence, thresholds, or approval.
 
-- No trusted FastAPI principal provider: workflow endpoints return `503` and do not start the graph.
-- No deterministic evaluator: the MCP service returns `EVALUATOR_NOT_CONFIGURED`; a review request may be recorded, but the workflow is not eligible to commit.
-- Ollama unavailable, timed out, malformed, or altered output: the result has no recommendation and cannot resume to commit.
-- MCP tool failure or timeout: the workflow records an error and seeks clinician review where possible; it never synthesizes tool output.
-- Stale assessment, wrong clinician, missing/revoked approval, permission failure, or idempotency conflict: the existing MCP service rejects the commit.
+## Workflow and state gates
 
-## Runtime and deployment
+The workflow in `triage_sentinel.workflow.service.TriageWorkflow` uses one
+LangGraph graph with explicit transitions:
 
-The workflow dependency group installs LangGraph, MCP, and the HTTP client. The model runs separately in a local Ollama-compatible runtime; default model identifier is `qwen3:1.7b`. On 2026-10-14 the official Ollama model catalog reported approximately 1.4 GB for that model. This development container exposed 2 vCPUs and 7.8 GiB RAM with no GPU runtime. Ollama was run in Docker and the model was pulled into a persistent volume. The full opt-in integration test using the actual model, real MCP stdio process, PostgreSQL, and test-only synthetic evaluator/principal passed. Its result verifies workflow wiring and safety gates, not clinical evaluation or production authentication.
+1. Receive a typed synthetic encounter request.
+2. Call `validate_vitals` and check structure, units, timestamps, and caller
+   required-measurement completeness.
+3. On invalid/incomplete/tool failure, do not evaluate or call the model;
+   request clinician review if the review tool remains available.
+4. Retrieve the explicitly requested protocol from the Filesystem MCP server.
+   Verify registry approval, safe relative path, version, and SHA-256. No local
+   file fallback is used.
+5. Call `evaluate_triage_rules` only when validation and reference checks pass.
+6. Send the deterministic evaluation to Ollama for a structured draft; reject
+   malformed, changed, or added claims.
+7. Call `request_clinician_review`. The pending request cannot update the live
+   queue.
+8. Pause for a separately authenticated clinician decision.
+9. On resume, the FastAPI backend checks workflow gates, exact assessment
+   version, authenticated permissions, and approval state. It then invokes the
+   protected MCP commit tool.
+10. Record workflow state, transitions, tool action IDs, timestamps, and
+    digests. Raw model/tool payloads are not included in the workflow execution
+    record.
 
-The stdio MCP server still requires `DATABASE_URL` and `TRIAGE_MCP_CLINICAL_EVALUATOR`. Approval and commit also require trusted identity integration. The synthetic evaluator and identity provider used by the opt-in integration test live only under `tests/` and are not production configuration. No queue operation runs during workflow start. The model never receives approval authority or invokes the queue tool itself.
+The model has no approval identity and cannot invoke its own queue commit.
+Database-backed audit history exists for tool attempts and clinical review
+actions. However, the complete authorization/audit design has not been
+verified end-to-end in this checkout; see the findings below and
+[EVALS.md](./EVALS.md).
 
-This is a synthetic-data competition prototype, not a clinically validated or approved medical device. No diagnosis, treatment, discharge, admission, or referral behavior is implemented. It must not delay direct clinical assessment or emergency response. See [EVALS.md](EVALS.md) for scenario-level checks and limitations.
+## Custom MCP server: `triage-tools-mcp`
 
-## Stage 6 External Filesystem MCP
+`backend/src/triage_tools_mcp/server.py` exposes typed Pydantic schemas through
+MCP stdio:
 
-### Data flow
+| Tool                           | Intended behavior                                                                                                                                             | Queue effect                                 |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `validate_vitals`              | Validate observation values, units, timestamps, and explicit completeness requirements; return issues and an action ID.                                       | None                                         |
+| `evaluate_triage_rules`        | Invoke the configured deterministic evaluator and return protocol/rule findings and evidence.                                                                 | None                                         |
+| `request_clinician_review`     | Create a pending request bound to an assessment version.                                                                                                      | None                                         |
+| `commit_approved_queue_update` | Independently check authenticated clinician permission, approval ownership/status, current assessment version, revocation, and idempotency; audit the result. | Append a queue event only after checks pass. |
 
-1. The FastAPI workflow request includes an explicit `protocol_id`; it does not contain a file path.
-2. After vital validation succeeds, LangGraph starts the official Filesystem MCP package as an MCP stdio child in a Docker container.
-3. The container is built from the exact npm package `@modelcontextprotocol/server-filesystem@1.0.0`, locked by `backend/filesystem-mcp/package-lock.json`, and a Node base image pinned by digest.
-4. The process has `--network=none`, `--read-only`, dropped capabilities, and one read-only host mount at `/protocols`. The Filesystem server itself offers write-capable tools; only `read_text_file` and `list_allowed_directories` are called.
-5. The client discovers tools, verifies the sole allowed root is `/protocols`, reads the registry, resolves exactly one document ID, checks approval status and a path-relative filename, retrieves the UTF-8 document, and verifies its SHA-256 against registry metadata.
-6. The graph passes the resulting typed document reference to `evaluate_triage_rules`. The deterministic evaluator must return the same document version. The model receives only the evaluator result, never the document text.
-7. Workflow persistence stores reference ID/version/source/license/class/checksum metadata and retrieval audit details, but not the source document body. The append-only audit event records `mcp.filesystem.read_text_file.succeeded` or `.failed` and refers to the workflow row containing server identity, tool name, timestamp, requested ID, returned version, digest, and error code.
+No unrestricted SQL or database tool is exposed to the model. The tool process
+expects `DATABASE_URL`; `TRIAGE_MCP_CLINICAL_EVALUATOR` and
+`TRIAGE_MCP_PRINCIPAL_PROVIDER` configure Python `module:attribute` adapters.
+The principal provider is a trusted-code boundary and must not accept
+model/request-supplied identity.
 
-### Fail-closed conditions
+**Known defect:** the current MCP `EvaluateTriageInput` lacks `age_months` and
+presenting-complaint context required by the IITT evaluator. Its output schema
+also narrows status/findings compared with the evaluator output. The latest
+test observed `INTERNAL_ERROR` rather than the expected structured evaluator
+error. The MCP evaluation path is therefore not currently reliable.
 
-Missing/unavailable server, missing tool, an unexpected allowed root, missing/duplicate document ID, malformed registry, unapproved document, unsafe relative path, checksum mismatch, or invalid document response prevents evaluator invocation and requests clinician review where possible. Approval resume additionally rechecks that the stored evaluator version, retrieved version, document ID, digest, pinned server identity, and tool name agree. The external server cannot approve, change evaluator rules, or invoke the protected queue tool.
+## Borrowed Filesystem MCP server
 
-`docs/clinical-protocols/approved/registry.json` contains no clinical entries at this time. Therefore production clinical evaluation remains unavailable until a source is verified, reuse terms and clinical authorization are recorded, and the deterministic evaluator supports that exact version. Tests use only a synthetic non-clinical document. It is not a substitute protocol.
+The reference reader uses the official
+`@modelcontextprotocol/server-filesystem` package from
+`modelcontextprotocol/servers`, pinned at version `1.0.0` and commit
+`c003d0d807409b22fa640d1f8e11f38f15755721`. A Docker image pins Node 24 by
+digest, uses the committed npm lockfile, runs with networking disabled and a
+read-only root filesystem, drops capabilities, and mounts only the approved
+reference directory read-only at `/protocols`.
 
-### Third-party package verification
+The workflow discovers tools and verifies the root, reads the registry and
+selected reference using `read_text_file`, validates approval/path/version, and
+checks the source content SHA-256. It does not call write tools and does not
+send document text to Ollama. The official server exposes write-capable tools,
+so the container boundary remains important.
 
-- Repository: `modelcontextprotocol/servers`, official Filesystem server under `src/filesystem`.
-- Package: `@modelcontextprotocol/server-filesystem`, npm stable `1.0.0`; published 2026-10-11. Repository release tag `v1.0.0` resolves to commit `c003d0d807409b22fa640d1f8e11f38f15755721`.
-- Published npm integrity: `sha512-2fN6qhpsiPSBAe0ev1qDPk4sCWdULCZQTuYc4ZY7+BDWQ1XCxLB+7dqStF2ZflgG4G/9vTwQsjxh7pjFqrrpcg==`; the committed lockfile pins this tarball and all transitive versions.
-- Compatibility: package manifest does not declare a Node engine. It built and ran on Node 24 in the pinned `node:24-alpine` container; the server uses MCP stdio and exposes documented read/write tools.
-- License: GitHub API reports repository `NOASSERTION`; npm metadata declares `SEE LICENSE IN LICENSE`, but the published tarball has no license file. The source repository root contains a mixed-license transition notice (Apache-2.0 for new/consented work, MIT for some prior contributions, CC-BY-4.0 for non-specification documentation). Exact package-code licensing is unclear; no source is copied here, and redistribution requires legal review.
+**License blocker:** the repository license API reports `NOASSERTION`; npm
+metadata says `SEE LICENSE IN LICENSE`, but the published package tarball has
+no license file. The upstream source has a mixed-license transition notice.
+No package source is copied into this repository, but the precise terms for
+the pinned package require legal review before redistribution.
 
-The reproducible build and integration command and actual results are recorded in [EVALS.md](EVALS.md). Docker daemon access is privileged and must be restricted to the backend service account.
+## Model and local inference
+
+The adapter uses Ollama's `/api/chat`, JSON-schema output mode, and temperature
+zero. The configured model ID is persisted with workflow metadata. The upstream
+[Qwen3-1.7B model card](https://huggingface.co/Qwen/Qwen3-1.7B) declares an
+Apache-2.0 license; this is an open-weight model family, but the exact Ollama
+artifact digest is not pinned here. No cloud model endpoint is selected by
+default; however, `TRIAGE_OLLAMA_URL` is configurable and must remain loopback
+unless remote use is explicitly reviewed.
+
+At this audit, this Windows host reported 4 logical processors, 11.9 GiB RAM,
+and Intel HD Graphics; Ollama was not installed/responding and no model
+completion was verified. The preceding integration environment recorded one
+successful 39-test live run; a later attempt reported 38 passed and one
+`MODEL_UNAVAILABLE` failure. The later failure is the current result, not a
+claim of local readiness.
+
+## Human approval and audit
+
+- Workflow start and approval must obtain a principal from a trusted backend
+  provider; request JSON and LLM output are not identity sources.
+- Pending review is distinct from an approved clinician decision.
+- The protected commit tool independently checks exact approval/assessment
+  binding, current version, revocation, authorization, and idempotency.
+- Successful and failed tool actions are represented by execution and audit
+  records with action IDs, timestamps, and digests. Review/override records
+  include clinician reference and reason.
+- Dashboard review/override requires authorization; overrides require a
+  reason. The protected queue commit is not equivalent to recording a review.
+
+Audit gaps: dashboard queue/detail reads are unauthenticated, complaint text is
+not guarded against sensitive-looking values, and the database-backed full
+suite could not run in the latest environment. These findings preclude a
+submission-ready security claim.
+
+## License
+
+The root [MIT license](./LICENSE) is an
+[OSI-approved license](https://opensource.org/license/mit/) and applies to
+project-authored material only.
+Third-party dependencies and the WHO reference criteria have separate
+copyright/license terms. See [WHO-IITT.md](./docs/clinical-protocols/WHO-IITT.md)
+and the Filesystem MCP notice above; do not infer that the root license grants
+rights to external content.

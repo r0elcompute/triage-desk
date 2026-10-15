@@ -1,51 +1,148 @@
-# Stage 5 Evaluation Record
+# Evaluation Record
 
-## Scope
+## Scope and result summary
 
-These are engineering tests using synthetic data. They verify workflow control flow and safety gates only. The opt-in end-to-end test uses live local Ollama, the real custom MCP stdio server, the official third-party Filesystem MCP container, PostgreSQL, and test-only synthetic evaluator/clinician-provider fixtures. No clinical validity, safety, sensitivity, specificity, or readiness claim is made. The repository still has no configured deterministic IITT evaluator, approved clinical protocol document, or production trusted identity provider.
+This evaluation uses synthetic cases only. It is an engineering verification,
+not clinical validation, safety validation, or evidence of suitability for
+patient care. Expected behavior is based on the selected protocol subset and
+software contracts; no expected result was changed to fit an observation.
 
-## Synthetic workflow scenarios
+Latest full backend result recorded in the Stage 9 audit:
 
-| Scenario                                                                               | Source/expectation                                                                                                                       | Actual result                                                                                                  | Status |
-| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------ |
-| Valid synthetic observation; deterministic tool returns an empty synthetic finding set | Engineering expectation: call validation, deterministic evaluator, and pending-review tool in order; do not commit during workflow start | Pending-review state returned; model ID, tool results, transitions, and review request present; no commit call | Pass   |
-| Required observation incomplete                                                        | Engineering expectation: do not call evaluator or model; request clinician review; reject resume                                         | Evaluator skipped, no recommendation, pending review created; resume eligibility check rejects                 | Pass   |
-| Model adds a finding not in the tool result                                            | Engineering expectation: reject changed structured output and do not persist a recommendation                                            | `MODEL_OUTPUT_REJECTED`; no recommendation; review requested                                                   | Pass   |
-| MCP validation times out                                                               | Engineering expectation: do not evaluate or generate findings; request review                                                            | `TOOL_TIMEOUT`; review requested; evaluation skipped                                                           | Pass   |
-| Non-synthetic source reference                                                         | Engineering expectation: reject input at request schema                                                                                  | Pydantic validation rejects the request                                                                        | Pass   |
-| Workflow request with no trusted principal provider                                    | Engineering expectation: fail closed before running workflow                                                                             | API returns `503`; graph is not invoked                                                                        | Pass   |
-| Approved resume through workflow adapter                                               | Engineering expectation: call only the protected `commit_approved_queue_update` tool after eligibility checks                            | Fake tool returns a committed result; workflow transitions to `committed`                                      | Pass   |
-| Same review request approved again by the same clinician                               | Engineering expectation: safely resume by reusing the existing approval                                                                  | Same approval ID returned                                                                                      | Pass   |
-| Same review request attempted by another clinician                                     | Engineering expectation: do not transfer approval identity                                                                               | Backend raises `ALREADY_APPROVED`                                                                              | Pass   |
-| FastAPI start, durable review, then independently approved MCP commit                  | Engineering expectation: model result is pending first; queue is unchanged until backend approval and protected commit                   | Pending state and normalized workflow result persisted; queue empty before approval; one approved event after  | Pass   |
-| Resume with artifacts bound to another assessment                                      | Engineering expectation: reject mismatched assessment/evaluation/review IDs before calling commit                                        | `ValueError`; no `commit_approved_queue_update` call                                                           | Pass   |
-| Filesystem MCP discovery and approved reference retrieval                              | Engineering expectation: discover tools, read selected document over MCP, verify version and SHA-256                                    | `read_text_file` returned test protocol `test-v1` with matching digest                                        | Pass   |
-| Read outside the configured `/protocols` root                                          | Engineering expectation: deny all paths outside the single allowed root                                                                 | Real server rejected `/etc/passwd`                                                                           | Pass   |
-| Write attempt against the read-only reference mount                                    | Engineering expectation: container mount blocks mutation even though server offers write tools                                          | Real `write_file` failed; fixture directory unchanged                                                        | Pass   |
-| Missing clinical protocol                                                           | Engineering expectation: do not substitute; skip evaluation and request review                                                         | Empty production registry returned `PROTOCOL_DOCUMENT_NOT_FOUND`                                              | Pass   |
-| Malformed or unapproved registry entry                                                | Engineering expectation: reject metadata before evaluator                                                                             | Malformed JSON and `approval_status=pending` failed closed                                                   | Pass   |
-| Document checksum mismatch                                                            | Engineering expectation: reject content before evaluator                                                                               | `PROTOCOL_CHECKSUM_MISMATCH`; no document returned                                                           | Pass   |
-| Filesystem MCP server unavailable                                                     | Engineering expectation: record failure and do not fall back to local file I/O                                                         | Missing Docker command returned `FILESYSTEM_MCP_UNAVAILABLE`                                                  | Pass   |
-| Retrieval provenance passed into evaluator                                             | Engineering expectation: workflow invokes the external server before evaluator and persists audit provenance                           | Actual API test persisted server/tool/time/document/version/hash; evaluator returned retrieved `test-v1`      | Pass   |
+```text
+python -m pytest -q
+54 passed, 7 skipped, 1 failed, 14 errors in 6.15 s
+```
 
-The clinical evaluator tests use the MCP service's synthetic fixture protocol only. They do **not** assert any WHO IITT criteria or clinical category.
+The 14 errors are database-test fixture setup failures because
+`TEST_DATABASE_URL` was unset. The failed MCP evaluation test is an actual
+schema/runtime defect: `EvaluateTriageInput` lacks `age_months`, which the
+IITT evaluator immediately accesses, so the result is `INTERNAL_ERROR`.
 
-## Commands and observed results
+Fresh focused rerun for this submission:
 
-- `docker build -t triage-filesystem-mcp:1.0.0 backend/filesystem-mcp`: **passed** using the locked npm package and immutable Node image digest.
-- `TRIAGE_RUN_FILESYSTEM_MCP_INTEGRATION=1 python -m pytest -q tests/test_reference_mcp.py`: **5 passed** against the actual pinned Filesystem MCP container.
-- `TEST_DATABASE_URL=postgresql+psycopg://postgres@127.0.0.1:5432/triage_sentinel_test TRIAGE_RUN_OLLAMA_INTEGRATION=1 TRIAGE_RUN_REAL_MCP_INTEGRATION=1 TRIAGE_RUN_FILESYSTEM_MCP_INTEGRATION=1 python -m pytest -q`: **39 passed in 91.31 seconds**. This includes migrations/schema checks, live Qwen, the actual Filesystem MCP container, the actual `triage-tools-mcp` process, retrieval audit persistence, queue isolation before approval, backend clinician approval, and protected commit.
-- The live integrations are opt-in and require Ollama with `qwen3:1.7b`, Docker and the built `triage-filesystem-mcp:1.0.0` image, PostgreSQL, the `triage-tools-mcp` command, and synthetic fixtures.
-- Focused Ruff checks over modified Python implementation, migration, and test files: **passed**.
-- `./frontend/node_modules/.bin/prettier --check .`: **passed** after formatting this file.
-- Alembic migration/schema comparison: **passed** through revision `0003_workflow_executions` against PostgreSQL.
-- Live local Ollama and both actual MCP servers ran through LangGraph; protocol retrieval was performed through MCP, not ordinary local file I/O.
+```text
+python -m pytest -q tests/test_iitt_evaluator.py tests/test_mcp_tools.py \
+  tests/test_workflow.py tests/test_reference_mcp.py
+42 passed, 7 skipped, 1 failed in 3.99 s
+```
 
-## Unsupported and unresolved
+It reproduced the same MCP/evaluator failure. The skips are opt-in integration
+tests requiring PostgreSQL, Ollama, Docker, and/or the Filesystem MCP image.
 
-- There is no configured IITT evaluator. Without it, the real evaluator MCP tool fails closed and no workflow becomes eligible for queue commit.
-- The real trusted principal provider is not bundled. Workflow endpoints return `503` until it is configured; do not use model/request-provided identity fields.
-- The real production IITT evaluator and production trusted identity provider remain unconfigured. The end-to-end test uses test-only synthetic substitutes and must not be treated as a clinical evaluation or production authorization setup. Model timeout and malformed-output behavior are covered with deterministic fake adapters, not injected failures against a live server.
-- The production-approved protocol registry is empty. A verified clinical source, license/reuse review, clinical authorization, and a deterministic evaluator for its exact version are still required before clinical evaluation can run.
-- GitHub reports the server repository license as `NOASSERTION`; npm says `SEE LICENSE IN LICENSE`, but the published tarball has no license file. The source root contains a mixed license-transition notice, so exact package-code terms remain unclear; no server source is copied into this project.
-- No clinical protocol criteria are implemented or tested here.
+Other recorded checks:
+
+| Check                                                       | Actual result                                                                                                                                                               |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| IITT evaluator suite                                        | 27 passed                                                                                                                                                                   |
+| MCP tools suite                                             | 6 passed, 1 failed                                                                                                                                                          |
+| Workflow suite                                              | 9 passed, 2 skipped                                                                                                                                                         |
+| Dashboard API auth checks                                   | 4 passed, 1 deselected                                                                                                                                                      |
+| Workflow + reference MCP tests with opt-in integrations off | 9 passed, 7 skipped                                                                                                                                                         |
+| Frontend lint, typecheck, production build                  | Passed                                                                                                                                                                      |
+| Ruff on changed backend modules and Python compileall       | Passed                                                                                                                                                                      |
+| Repository-wide `ruff check backend/src tests`              | Failed: 5 findings in untouched files                                                                                                                                       |
+| Most recent live Ollama attempt                             | 38 passed, 1 failed (`MODEL_UNAVAILABLE`)                                                                                                                                   |
+| Prior live integration attempt                              | 39 passed in 91.31 s; historical only, does not supersede the later failure                                                                                                 |
+| Custom MCP stdio process                                    | Tool discovery listed all four tools; `validate_vitals` returned valid/incomplete with missing `heart_rate`; 1 tool execution and 1 audit row persisted in temporary SQLite |
+| Official Filesystem MCP                                     | Discovery failed with `FileNotFoundError` because Docker CLI/runtime is unavailable                                                                                         |
+
+Detailed commands, timings, tool results, findings, and source links are in
+[docs/STAGE9_AUDIT.md](./docs/STAGE9_AUDIT.md).
+
+## Synthetic scenarios
+
+The detailed audit matrix has 19 scenarios. This summary retains the actual
+outcome and tool/approval state; see the linked matrix for input details,
+evidence, exact timings, and test references.
+
+|   # | Scenario                                                  | Actual result                                                                                  | Tool behavior / approval state                                  |
+| --: | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+|   1 | Ordinary adult observations; no escalation rule fires     | **PASS**: `indeterminate`, no category; not labelled safe                                      | Evaluator only; no approval/queue write                         |
+|   2 | Adult heart rate 49 bpm                                   | **PASS**: red rule `IITT-ADULT-RED-HEART-RATE`, evidence linked                                | Evaluator finding only; no approval                             |
+|   3 | Missing observations and complaint                        | **PASS**: missing information explicit; no normal defaults                                     | No queue write                                                  |
+|   4 | Wrong unit, naive/future timestamp, duplicate observation | **PASS**: validation rejects invalid structures                                                | No evaluation/approval                                          |
+|   5 | Stale/duplicate reassessment trigger                      | **BLOCKED**: PostgreSQL fixture errors; ad-hoc SQLite attempt also failed before assertion     | No completed reassessment call                                  |
+|   6 | Authenticated clinician rejects synthetic assessment      | **PASS** in one-off in-memory API check; review/audit record observed                          | Rejected; no queue commit                                       |
+|   7 | Authorized clinician overrides with reason                | **PASS** in one-off in-memory API check; override/audit record observed                        | Override recorded; not a queue approval                         |
+|   8 | Override without required reason fields                   | **PASS**: HTTP 422                                                                             | No review/approval                                              |
+|   9 | Unauthenticated protected MCP queue commit                | **PASS**: `UNAUTHENTICATED`, audited                                                           | No unauthorized commit                                          |
+|  10 | Stale and revoked approvals                               | **PASS**: `STALE_ASSESSMENT` and `APPROVAL_REVOKED`                                            | No queue commit                                                 |
+|  11 | Duplicate commit / idempotency key conflict               | **PASS**: `already_committed` on retry; conflicting reuse rejected                             | Exactly one queue event                                         |
+|  12 | Duplicate identical clinician review request              | **PASS against current contract**: two pending IDs and audit rows; retry semantics not defined | No approval; duplicate review requests remain a design question |
+|  13 | Model output adds an unsupported finding                  | **PASS**: `MODEL_OUTPUT_REJECTED`; pending review                                              | No commit tool call                                             |
+|  14 | Protocol reference unavailable                            | **PASS**: `PROTOCOL_DOCUMENT_NOT_FOUND`; evaluation skipped                                    | Pending review; no commit                                       |
+|  15 | MCP evaluation input omits evaluator-required age         | **FAIL**: actual `INTERNAL_ERROR` / `AttributeError` instead of structured evaluator error     | No approval or queue commit                                     |
+|  16 | Dashboard queue with persistence unconfigured             | **PASS**: explicit HTTP 503, not empty success                                                 | No queue update                                                 |
+|  17 | Anonymous dashboard encounter detail read                 | **FAIL**: HTTP 200 returned synthetic reference and complaint without identity provider        | Read-only; privacy/access-control finding                       |
+|  18 | Complaint contains sensitive-looking text                 | **FAIL**: request accepted unchanged                                                           | No database write in check; synthetic-only intake guard absent  |
+|  19 | Invalid then valid `validate_vitals` MCP calls            | **PASS**: structured invalid/incomplete then valid/complete result; both audited               | No approval/queue update                                        |
+
+## Protocol traceability
+
+Clinical test expectations trace to the documented limited routine IITT
+subset, not to an LLM-generated rubric. It covers selected adult and pediatric
+heart-rate, respiratory-rate, temperature, oxygen saturation, AVPU, and
+under-two-month temperature criteria. Rules, exact comparators, source
+locations, ages, limitations, provenance, and reuse concerns are documented in
+[WHO-IITT.md](./docs/clinical-protocols/WHO-IITT.md).
+
+The evaluator is deterministic and can be tested directly. However, the custom
+MCP input/output contract currently does not carry all evaluator inputs/results,
+and the approved production registry is empty. Therefore test-level evaluator
+success must not be represented as a usable production workflow.
+
+## Live model and MCP status
+
+The repository records an earlier opt-in integration run using local Ollama,
+the custom MCP stdio process, the official Filesystem MCP container,
+PostgreSQL, and test-only synthetic evaluator/identity adapters: **39 passed
+in 91.31 seconds**. The later attempt reported **38 passed and 1 failed** with
+`MODEL_UNAVAILABLE`; current environment checks also found no responding
+Ollama endpoint, Docker CLI, or PostgreSQL test configuration. In this
+submission run, the custom stdio server successfully discovered its four tools
+and executed `validate_vitals`, persisting one tool execution and one audit row
+in a temporary SQLite fixture. This did not verify PostgreSQL behavior or the
+broken evaluator path. Filesystem MCP discovery failed because the Docker
+executable was unavailable.
+
+The framework dependency is open source: installed package metadata identified
+LangGraph 1.2.15 as MIT. This does not establish full clean-checkout execution.
+
+## Unresolved failure and next step
+
+The genuine runtime failure is the MCP/evaluator schema mismatch: the MCP
+input lacks `age_months` and presenting-complaint context used by the
+deterministic evaluator, while its output schema narrows evaluator statuses.
+The latest MCP test observed `INTERNAL_ERROR` at `data.age_months`; no approval
+or queue write occurred.
+
+**Next step:** define one versioned typed contract that carries age and
+complaint data only from explicit validated encounter inputs, supports all
+evaluator statuses/findings, and preserves evidence references. Add a
+successful evaluator-through-real-MCP test with a synthetic approved test
+protocol, then rerun the MCP, workflow, database, and full suites. Do not infer
+or fabricate missing clinical inputs to make the call pass.
+
+## Submission gaps
+
+- No clean-checkout run has been performed; current worktree contains
+  uncommitted changes.
+- No current local model task completed because Ollama is unavailable here.
+- Both MCP servers need fresh integration verification with configured local
+  services.
+- The offline `python scripts/demo_workflow.py` trace ran successfully, showing
+  the graph's pending-review path and missing-reference failure using explicit
+  test doubles. It is not a recording, live MCP tool run, or model execution.
+- No video has been recorded. The workflow script below uses test doubles and
+  does not meet the live demonstration requirement.
+- Database outage injection, packet-level egress capture, and full
+  database-backed audit checks were not performed.
+- A targeted scan for common credential/private-key token patterns found no
+  matches in the current working tree. Git tracks only `.env.example` files
+  among environment-file names. The evaluation used synthetic identifiers;
+  this scan is not a guarantee against every possible secret or personal-data
+  format.
+- No external request was made during this audit. Source review found
+  configurable remote backend/model URLs, and no packet-level egress capture
+  was performed.
