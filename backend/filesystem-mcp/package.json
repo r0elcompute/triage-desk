@@ -1,0 +1,9 @@
+{
+  "name": "triage-filesystem-mcp-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Locked runtime dependency for the official MCP Filesystem server",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "1.0.0"
+  }
+}

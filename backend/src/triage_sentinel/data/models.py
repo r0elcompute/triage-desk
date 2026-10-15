@@ -3,6 +3,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -425,6 +426,10 @@ class ClinicianReviewRequest(Base):
         back_populates="review_requests"
     )
 
+    @classmethod
+    def count(cls):
+        return func.count(cls.id)
+
 
 class ClinicianApproval(Base):
     __tablename__ = "clinician_approvals"
@@ -562,6 +567,80 @@ class QueueCommit(Base):
     )
 
 
+class WorkflowExecution(Base):
+    __tablename__ = "workflow_executions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending_review', 'failed', 'committed')",
+            name="ck_workflow_executions_status",
+        ),
+        CheckConstraint(
+            "input_digest ~ '^[0-9a-f]{64}$'",
+            name="ck_workflow_input_digest_sha256",
+        ),
+        CheckConstraint(
+            "result_digest ~ '^[0-9a-f]{64}$'",
+            name="ck_workflow_result_digest_sha256",
+        ),
+        CheckConstraint(
+            "completed_at >= started_at",
+            name="ck_workflow_execution_time_order",
+        ),
+        ForeignKeyConstraint(
+            ["assessment_version_id", "encounter_id"],
+            ["assessment_versions.id", "assessment_versions.encounter_id"],
+            ondelete="RESTRICT",
+            name="fk_workflows_assessment_encounter",
+        ),
+        ForeignKeyConstraint(
+            ["review_request_id"],
+            ["clinician_review_requests.id"],
+            ondelete="RESTRICT",
+            name="fk_workflows_review_request",
+        ),
+        ForeignKeyConstraint(
+            ["commit_action_id"],
+            ["tool_executions.id"],
+            ondelete="RESTRICT",
+            name="fk_workflows_commit_action",
+        ),
+        Index("ix_workflows_assessment_created", "assessment_version_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    encounter_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    assessment_version_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), nullable=False
+    )
+    model_identifier: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    input_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    transitions: Mapped[list[dict[str, str]]] = mapped_column(JSON, nullable=False)
+    reference_retrieval: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    protocol_reference: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    validation_result: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    validation_valid: Mapped[bool] = mapped_column(nullable=False)
+    validation_complete: Mapped[bool] = mapped_column(nullable=False)
+    evaluation_result: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    evaluation_action_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    recommendation_result: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    recommendation_valid: Mapped[bool] = mapped_column(nullable=False)
+    review_request_result: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    review_request_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    commit_action_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class QueueEvent(Base, TimestampMixin):
     __tablename__ = "queue_events"
     __table_args__ = (
@@ -654,7 +733,7 @@ class AuditLog(Base, TimestampMixin):
         CheckConstraint(
             "entity_type IN ('patient', 'encounter', 'complaint', "
             "'vital_observation', 'assessment_version', 'clinician_review', "
-            "'queue_event', 'tool_execution')",
+            "'queue_event', 'tool_execution', 'workflow_execution')",
             name="ck_audit_entity_type",
         ),
         CheckConstraint(

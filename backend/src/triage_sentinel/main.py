@@ -2,6 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from triage_sentinel.workflow_api import (
+    dashboard_router,
+)
+from triage_sentinel.workflow_api import (
+    router as workflow_router,
+)
+
 
 class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -27,7 +34,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -35,3 +42,7 @@ app.add_middleware(
 @app.get("/health", tags=["health"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+app.include_router(workflow_router)
+app.include_router(dashboard_router)

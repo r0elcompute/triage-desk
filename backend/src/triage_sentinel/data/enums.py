@@ -71,3 +71,4 @@ class AuditEntityType(StrEnum):
     CLINICIAN_REVIEW = "clinician_review"
     QUEUE_EVENT = "queue_event"
     TOOL_EXECUTION = "tool_execution"
+    WORKFLOW_EXECUTION = "workflow_execution"

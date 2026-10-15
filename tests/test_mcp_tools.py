@@ -34,6 +34,7 @@ from triage_tools_mcp.schemas import (
     CommitApprovedQueueUpdateInput,
     EvaluateTriageInput,
     EvaluateTriageOutput,
+    ProtocolReferenceInput,
     RequestClinicianReviewInput,
     TriageFinding,
     ValidateVitalsInput,
@@ -43,6 +44,7 @@ from triage_tools_mcp.service import (
     APPROVE_PERMISSION,
     COMMIT_PERMISSION,
     ClinicalEvaluator,
+    ToolFailure,
     TriageToolsService,
 )
 
@@ -242,6 +244,16 @@ def test_evaluate_triage_rules_calls_evaluator_and_structures_errors(
         encounter_id=assessment.encounter_id,
         assessment_version_id=assessment.id,
         observations=[],
+        protocol_reference=ProtocolReferenceInput(
+            protocol_id="TEST-SYNTHETIC-PROTOCOL",
+            version="synthetic-protocol-1",
+            approval_status="approved",
+            document_class="synthetic-test",
+            source_url="test-fixture://synthetic-protocol",
+            license="Synthetic test fixture",
+            content_sha256="0" * 64,
+            content="Synthetic-only protocol fixture.",
+        ),
     )
     result = TriageToolsService(
         session_factory, FixedEvaluator()
@@ -289,6 +301,29 @@ def test_review_request_is_pending_and_does_not_change_queue(
     assert request is not None
     assert request.reason == "Needs clinician review"
     assert queue_events == []
+
+
+def test_approval_resume_is_idempotent_for_the_same_clinician(
+    session_factory: sessionmaker[Session],
+) -> None:
+    assessment = setup_assessment(session_factory)
+    service = TriageToolsService(session_factory)
+    request_id = UUID(request_review(service, assessment.id))
+    reviewer = clinician(APPROVE_PERMISSION)
+
+    first_approval = service.approve_review_request(request_id, reviewer)
+    retried_approval = service.approve_review_request(request_id, reviewer)
+
+    assert retried_approval == first_approval
+    with pytest.raises(ToolFailure, match="different clinician"):
+        service.approve_review_request(
+            request_id,
+            AuthenticatedClinician(
+                subject="other-subject",
+                reference="SYN-CLINICIAN-OTHER",
+                permissions=frozenset({APPROVE_PERMISSION}),
+            ),
+        )
 
 
 def test_queue_commit_requires_authorized_exact_active_approval_and_is_idempotent(
